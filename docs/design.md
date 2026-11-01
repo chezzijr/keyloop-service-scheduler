@@ -72,7 +72,7 @@ flowchart LR
     end
 
     subgraph APP["FastAPI app"]
-        MW["Middleware: request_id, logging, metrics, OTel"]
+        MW["Middleware: request_id, logging, metrics"]
         RT["Routers and Pydantic schemas"]
         SV["Service layer: booking, availability, cancel"]
         RP["Repository: SQLAlchemy 2 async"]
@@ -84,7 +84,7 @@ flowchart LR
     SEED["Seed script"]
     MET["GET /metrics for Prometheus"]
     LOG["JSON logs to stdout"]
-    OTEL["OTLP exporter, optional"]
+    OTEL["OTel tracing: designed, not built"]
 
     UI --> MW
     CURL --> MW
@@ -100,14 +100,14 @@ flowchart LR
 | Component | Role |
 |---|---|
 | Client mock | The OpenAPI UI at `/docs`, cURL examples in the README and the pytest harness. They send the same HTTP requests a front end would. |
-| Middleware | Reads or creates the `request_id`, writes one JSON log line per request, records HTTP metrics and starts the OTel span. |
+| Middleware | Reads or creates the `request_id`, writes one JSON log line per request, and records HTTP metrics. |
 | Routers and schemas | Map HTTP to service calls. Pydantic models validate the body, the 15-minute grid and the booking window, and return 422 on failure. They also turn service errors into `problem+json`. |
 | Service layer | Business rules. Booking: ownership check, end time, opening hours and shift checks, candidate ranking, the `SAVEPOINT` insert loop and the reason choice. Availability: slot generation for one local date. Cancel: the status update. No HTTP types here, so the rules can be unit tested. |
 | Repository | All SQL, through SQLAlchemy 2 async with asyncpg. Runs the candidate queries and the insert, and maps SQLSTATE `23P01` (with the constraint name) and `23505` to typed errors for the service layer. |
 | PostgreSQL 18 | Stores all data. The exclusion constraints `no_bay_overlap` and `no_tech_overlap` and the UNIQUE `idempotency_key` are the final check against double-booking and duplicate requests. |
 | Alembic migrations | Create the schema, the `btree_gist` extension and both exclusion constraints. Run before the API starts. |
 | Seed script | Loads the reference data (Assumption 1): dealerships, bays, technicians, skills, shifts, opening hours, service types, customers and vehicles. |
-| Observability outputs | `/metrics` in Prometheus text format, JSON logs on stdout, and OTel traces sent over OTLP only when an endpoint is configured. |
+| Observability outputs | `/metrics` in Prometheus text format, and JSON logs on stdout. OTel tracing is designed but not built (see Observability). |
 
 Deployment. `docker compose` runs two services: `api` (the FastAPI app under uvicorn) and `postgres` (the `postgres:18` image with a named volume). Migrations run before the API starts. The seed script is a separate command. The API keeps no state between requests. Everything lives in Postgres, so more API containers can be added without code changes (see Scalability, Performance and Reliability).
 
@@ -470,14 +470,14 @@ Versions are the ones installed and imported on Python 3.14 on 2026-11-01.
 | PostgreSQL 18 + `btree_gist` | `tstzrange` and `EXCLUDE USING gist` make "no overlap" a database rule (see Concurrency and Correctness). `btree_gist` lets the GiST index compare plain `bigint` ids with `=`. Checked on the `postgres:18` image. | MySQL or SQLite. Neither has exclusion constraints, so the overlap rule would need locks in the application. |
 | structlog 26.1 | JSON log lines with bound context, so `request_id` is added once per request and shows on every line. | The standard `logging` module with a JSON formatter. Works, but binding per-request context takes more code. |
 | prometheus-client 0.26 | The standard Python client for Prometheus counters and histograms, served at `/metrics`. | OTel metrics. Possible, but Prometheus scraping needs no collector to run locally. |
-| opentelemetry-instrumentation-fastapi 0.66b2 | Traces each HTTP request with no code in the handlers. Database spans come from `opentelemetry-instrumentation-sqlalchemy` 0.66b2 and export from `opentelemetry-exporter-otlp` 1.45.2 (both installed and imported on Python 3.14). The exporter is off unless configured. | No tracing. With a single service, logs plus `request_id` cover most needs, but tracing is cheap to add and shows the database time per request. |
+| OpenTelemetry (designed, not built) | Would trace each request and its database queries. Not built: with one service and one database, logs with `request_id` and `latency_ms` plus latency metrics answer "which request was slow", and a trace viewer would add a component to run. The packages were install-checked on Python 3.14 (`opentelemetry-instrumentation-fastapi` and `-sqlalchemy` 0.66b2, `opentelemetry-exporter-otlp` 1.45.2), so adding it later is a small step. | Build it now. Rejected: 3 more packages, two of them beta, and nothing visible in the demo without a trace viewer. |
 | pytest 9.1 + testcontainers 4.15 + httpx 0.28 | pytest runs all tests. testcontainers starts a real `postgres:18` container for the test session, because the core rule lives in Postgres. httpx `AsyncClient` calls the app in process for API tests. | SQLite in memory. Fast, but it cannot run exclusion constraints, so it would not test the core rule. A shared compose database for tests was also possible, but testcontainers gives each run a clean database. |
 | uv | One tool for the Python version, the virtual env, dependency locking and running commands. Fast installs in Docker and CI. | pip with venv, or Poetry. Both work; uv is faster and puts the Python version, the lock file and the commands in one tool. |
 | Docker compose | One command starts the API and Postgres for a reviewer. Same Postgres image as the tests. | Running Postgres on the host. Harder to reproduce on another machine. |
 
 ## Observability
 
-Three signals: logs, metrics and traces. All three carry or link to the same `request_id`.
+Two signals are built: logs and metrics. Logs carry the `request_id`. Traces are designed but not built (see Traces below).
 
 Request id. The middleware reads the `X-Request-ID` header. If it is missing, it creates a new random id. The id is bound to the log context for the request, returned in the `X-Request-ID` response header, and put in the `request_id` field of every problem body (see API). A client or support person can quote it and find every log line of that request.
 
@@ -500,9 +500,9 @@ Request bodies are not logged, so customer names and emails stay out of the logs
 
 Metrics. Served at `GET /metrics` in Prometheus text format: request latency per route, bookings made, bookings rejected by reason, insert attempts per booking (contention), and cancels. The full table is in Appendix A.
 
-Label cardinality. Labels only take values from a small, fixed set: route templates, methods, status codes, reasons and dealership ids. Customer ids, vehicle ids, appointment ids, idempotency keys and request ids are never labels. Each new label value creates a new time series in Prometheus, so an unbounded id would grow memory without limit. Those ids belong in logs and traces.
+Label cardinality. Labels only take values from a small, fixed set: route templates, methods, status codes, reasons and dealership ids. Customer ids, vehicle ids, appointment ids, idempotency keys and request ids are never labels. Each new label value creates a new time series in Prometheus, so an unbounded id would grow memory without limit. Those ids belong in logs.
 
-Traces. OpenTelemetry instruments FastAPI (one span per request) and SQLAlchemy (one child span per query), so a slow booking shows whether the time went to the candidate queries, the insert loop or a wait on another transaction. The OTLP exporter is off by default. Setting `OTEL_EXPORTER_OTLP_ENDPOINT` turns it on. Without it, no spans leave the process.
+Traces (designed, not built). OpenTelemetry would instrument FastAPI (one span per request) and SQLAlchemy (one child span per query), so a slow booking would show whether the time went to the candidate queries, the insert loop or a wait on another transaction. Spans would go over OTLP to a viewer such as Jaeger, switched on by `OTEL_EXPORTER_OTLP_ENDPOINT`. It is not built because this system has one service and one database: the `request_id` in logs, `latency_ms` and the latency histogram already find a slow request. Tracing pays off once a request crosses several services.
 
 Health checks.
 
@@ -531,7 +531,7 @@ Maintainability (built):
 - Layers with one job each: routers and schemas (HTTP), service layer (business rules), repository (SQL). The business rules use no HTTP or database types, so they can change and be unit tested on their own (see Architecture).
 - The schema changes only through Alembic migrations, so every environment and test database has the same schema and its history.
 - The OpenAPI spec is generated from the code, so the API contract cannot drift from the implementation.
-- Configuration (database URL, pool size, timeouts, OTel endpoint) comes from environment settings, not code.
+- Configuration (database URL, pool size, timeouts) comes from environment settings, not code.
 - The test suite in Testing Strategy covers every business rule, so a change that breaks one fails a test.
 
 Future, not built:
@@ -639,6 +639,7 @@ What I would do differently, and the limits:
 - Automatic push of later appointments when a job overruns, a reassign endpoint, and recording actual start and finish times (see "Operational delays" in Data Flow).
 - Read replica for availability, managed Postgres with failover, and partitioning by dealership. See Scalability, Performance and Reliability.
 - An alerting stack. Only example rules are written (see Appendix A).
+- Distributed tracing with OpenTelemetry (see Traces in Observability).
 
 Working hours and the availability query are steps 3 and 4 of the build order. If either is not built by the deadline, this document will mark it "designed, not built".
 
