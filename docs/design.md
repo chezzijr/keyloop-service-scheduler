@@ -45,7 +45,7 @@ Each line is a decision taken where the brief is silent.
 9. Duration comes from the service type. The client does not send an end time. End = start + duration. This is a planned end, not a measured one (Assumption 24).
 10. Each service type requires one bay type (for example `lift`, `alignment`) and one technician skill (for example `ev_hv`). A bay is compatible if its type matches. A technician is qualified if they have the skill.
 11. One appointment covers exactly one service type.
-12. Dealership opening hours and technician shifts are a weekly pattern: weekday (ISO, 1 = Monday) with a local start and end time, one window per weekday (no split shifts). There are no holidays, closures or one-off exceptions.
+12. Dealership opening hours and technician shifts are a weekly pattern: weekday (ISO, 1 = Monday) with a local start and end time, one window per weekday (no split shifts). So lunch breaks are not modelled: a technician counts as available for the whole shift. The 15-minute buffer (Assumption 24) is slack for overruns, not a break, because an overrun uses it up. There are no holidays, closures or one-off exceptions.
 13. The work part `[start, end)` must fall inside the dealership's opening hours and inside the assigned technician's shift for that weekday. The buffer (Assumption 24) may run past closing time. An appointment does not cross midnight local time.
 14. Booking window: the start must not be in the past and must be at most 90 days ahead.
 15. Time ranges are half-open `[start, end)`. An appointment ending at 10:00 does not conflict with one starting at 10:00.
@@ -632,7 +632,8 @@ What I would do differently, and the limits:
 - Rescheduling. It would be cancel + book in one transaction, so the old slot is only freed if the new one is booked.
 - Notifications to the customer or the advisor.
 - Authentication and authorisation. An API gateway in front of the service is assumed to handle them (Assumption 23).
-- Holidays, one-off closures and split shifts (Assumption 12).
+- Holidays and one-off closures (Assumption 12).
+- Lunch breaks and split shifts (Assumption 12). Technicians are treated as available for their whole shift; the buffer is slack for overruns, not a break. The next step would be several windows per day (for example 08:00 to 12:00 and 13:00 to 17:00), with the rule that a job must fit inside one window.
 - Multi-service appointments: one appointment covers one service type (Assumption 11).
 - A customer's preferred technician. The system always picks by load (Assumption 3).
 - Jobs over several days, fault diagnosis, waiting for parts (Assumption 26).
