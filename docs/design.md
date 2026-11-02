@@ -5,7 +5,7 @@ Status: draft, 2026-11-01. Scenario A (backend implemented, client mocked).
 ## Key Decisions
 
 - One FastAPI service + one PostgreSQL 18 database; the client is mocked (OpenAPI UI, cURL, tests).
-- Double-booking is impossible: two Postgres `EXCLUDE` constraints reject any overlap for the same bay or technician, even with many API servers.
+- Double-booking is impossible: three Postgres `EXCLUDE` constraints reject any overlap for the same bay, technician or vehicle, even with many API servers.
 - The system picks the bay and technician: least-loaded qualified tech, lowest-id bay.
 - A booking reserves planned work time + a 15-min buffer; overruns are handled by the advisor.
 - A vehicle cannot be in two bookings at once, so a resent request gets 409, not a second booking. Cancel frees the slot.
@@ -21,7 +21,7 @@ The brief's three core requirements map to the design like this:
 | Brief requirement | Where it is handled |
 |---|---|
 | 1. Resource constrained booking | `POST /appointments` with vehicle, service type, dealership and start time |
-| 2. Real-time availability check for bay and technician over the whole duration | Booking service picks a candidate pair; two Postgres exclusion constraints reject any overlap at insert time |
+| 2. Real-time availability check for bay and technician over the whole duration | Booking service picks a candidate pair; three Postgres exclusion constraints (bay, technician, vehicle) reject any overlap at insert time |
 | 3. Confirmed appointment record | `appointment` table row linking customer, vehicle, technician and service bay |
 
 Scope:
@@ -113,16 +113,18 @@ erDiagram
     VEHICLE ||--o{ APPOINTMENT : "serviced in"
 ```
 
-Columns, the seed service types and the other database guards (a status `CHECK` and dealership foreign keys) are in [details/data-model.md](details/data-model.md).
+Columns, the seed service types and the other database guards (`CHECK`s on status, durations, opening hours and `ends_at`, and dealership foreign keys) are in [details/data-model.md](details/data-model.md).
 
 The rule against double-booking lives in the database, not in application code:
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS btree_gist;  -- lets gist index a plain bigint with =
 
+-- a vehicle cannot be in two bookings at once; this also stops a resent request.
+-- Created first, so Postgres checks it first (see Data Flow).
 ALTER TABLE appointment
-  ADD CONSTRAINT no_bay_overlap
-  EXCLUDE USING gist (service_bay_id WITH =, during WITH &&)
+  ADD CONSTRAINT no_vehicle_overlap
+  EXCLUDE USING gist (vehicle_id WITH =, during WITH &&)
   WHERE (status <> 'cancelled');
 
 ALTER TABLE appointment
@@ -130,10 +132,9 @@ ALTER TABLE appointment
   EXCLUDE USING gist (technician_id WITH =, during WITH &&)
   WHERE (status <> 'cancelled');
 
--- a vehicle cannot be in two bookings at once; this also stops a resent request
 ALTER TABLE appointment
-  ADD CONSTRAINT no_vehicle_overlap
-  EXCLUDE USING gist (vehicle_id WITH =, during WITH &&)
+  ADD CONSTRAINT no_bay_overlap
+  EXCLUDE USING gist (service_bay_id WITH =, during WITH &&)
   WHERE (status <> 'cancelled');
 ```
 
@@ -150,7 +151,7 @@ The OpenAPI UI served at `/docs` is the mocked client. It lists every endpoint w
 | GET | `/ready` | Readiness: the database answers | 200 (503 if not) |
 | GET | `/metrics` | Prometheus metrics | 200 |
 
-Errors use RFC 9457 `application/problem+json`. A conflict with other bookings returns 409 with a `reason` (`no_bay`, `no_technician`, `vehicle_busy`); bad input returns 422. Query parameters, request and response examples and the full status code list are in [details/api.md](details/api.md).
+Errors use RFC 9457 `application/problem+json`. A conflict with other bookings returns 409 with a `reason` (`no_bay`, `no_technician`, `vehicle_busy`); bad input returns 422. Request and response examples and the full status code list are in [details/api.md](details/api.md).
 
 ## Data Flow
 
@@ -216,7 +217,7 @@ Notes on the loop:
 - The constraint name in the `23P01` error tells the service which resource clashed. It drops only that tech or that bay and keeps the other.
 - Vehicle clash. A `23P01` on `no_vehicle_overlap` ends the loop at once. Another pair cannot help, because the vehicle itself is booked.
 - Retry bound. Each failed attempt removes one tech or one bay, so no pair is tried twice and the loop ends by itself after at most |T| + |B| attempts. There is no fixed cap: a fixed cap below |T| + |B| could give up while a free pair is left. At dealership scale, |T| + |B| is a few dozen at most.
-- Reason when no pair succeeds. First the service checks the vehicle again: if it now has an overlapping booking, the reason is `vehicle_busy`. A resent request can lose on the technician or bay index first, because Postgres checks the indexes in creation order, and then run out of candidates; this check gives it the right reason anyway. Otherwise, if the tech list is empty, the reason is `no_technician`, even if the bays are also full. Otherwise the reason is `no_bay`. This order is an assumption: a qualified technician is usually harder to find than a free bay, so it is the more useful thing to tell the advisor.
+- Reason when no pair succeeds. First the service checks the vehicle again: if it now has an overlapping booking, the reason is `vehicle_busy`. Postgres checks the indexes in creation order, and `no_vehicle_overlap` is created first, so a resent request normally fails on the vehicle. This re-check stays as a safety net: the right reason must not depend on index order, which a later migration could change. Otherwise, if the tech list is empty, the reason is `no_technician`, even if the bays are also full. Otherwise the reason is `no_bay`. This order is an assumption: a qualified technician is usually harder to find than a free bay, so it is the more useful thing to tell the advisor.
 
 Cancel flow (`POST /appointments/{id}/cancel`): the service runs `UPDATE appointment SET status = 'cancelled', cancelled_at = now() WHERE id = :id AND status = 'confirmed'`. The exclusion constraints have `WHERE (status <> 'cancelled')`, so the row stops counting at once and the bay and technician are free for new bookings. If the row is already cancelled, the update touches nothing and the service returns 200 with the stored record. An unknown id returns 404.
 

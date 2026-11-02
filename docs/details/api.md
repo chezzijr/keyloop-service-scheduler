@@ -66,6 +66,6 @@ Status codes:
 - `404 Not Found`: appointment id does not exist.
 - `409 Conflict`: the request is valid but conflicts with other bookings. `reason` is one of `no_bay`, `no_technician`, `vehicle_busy`.
 - `422 Unprocessable Content`: validation failed. Examples: start not on the 15-minute grid, start in the past, start more than 90 days ahead, work outside opening hours (`reason: outside_hours`), vehicle not owned by the customer, unknown reference id. The problem body lists the failing fields in `errors`.
-- `503 Service Unavailable`: `/ready` when the database cannot be reached, or any request whose query hits the database `statement_timeout` (see [Scalability, Performance and Reliability](../design.md#scalability-performance-and-reliability)).
+- `503 Service Unavailable`: `/ready` when the database cannot be reached, any request whose database connection fails, or any request whose query hits the database `statement_timeout` (see [Scalability, Performance and Reliability](../design.md#scalability-performance-and-reliability)).
 
 All error bodies use RFC 9457 `application/problem+json` with `type`, `title`, `status`, `detail`, `instance`, plus `reason` for 409 and for 422 `outside_hours`, `appointment_id` for `vehicle_busy`, and `request_id` for tracing.

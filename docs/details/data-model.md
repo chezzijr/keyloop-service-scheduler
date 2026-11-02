@@ -86,6 +86,7 @@ erDiagram
         bigint service_bay_id FK
         bigint technician_id FK
         tstzrange during "half-open, start to end + buffer"
+        timestamptz ends_at "work end, stored at insert"
         text status "confirmed or cancelled"
         timestamptz created_at
         timestamptz cancelled_at "null unless cancelled"
@@ -121,6 +122,29 @@ ALTER TABLE appointment
 ALTER TABLE appointment
   ADD CONSTRAINT tech_in_dealership
   FOREIGN KEY (technician_id, dealership_id) REFERENCES technician (id, dealership_id);
+
+-- the work end lies inside the reserved range (the buffer may be 0)
+ALTER TABLE appointment
+  ADD CONSTRAINT ends_at_in_during
+  CHECK (lower(during) < ends_at AND ends_at <= upper(during));
+
+-- durations sit on the 15-minute grid
+ALTER TABLE service_type
+  ADD CONSTRAINT duration_valid
+  CHECK (duration_minutes > 0 AND duration_minutes % 15 = 0);
+
+ALTER TABLE service_type
+  ADD CONSTRAINT buffer_valid
+  CHECK (buffer_minutes >= 0 AND buffer_minutes % 15 = 0);
+
+-- ISO weekday, and one window that opens before it closes
+ALTER TABLE opening_hours
+  ADD CONSTRAINT weekday_valid CHECK (weekday BETWEEN 1 AND 7);
+
+ALTER TABLE opening_hours
+  ADD CONSTRAINT hours_valid CHECK (opens_at < closes_at);
 ```
 
-An insert that overlaps an active appointment on the same bay or technician fails with SQLSTATE `23P01`, and the error names the constraint, so the service knows which resource clashed. The booking service checks that the vehicle belongs to the customer before the insert. A composite foreign key `(vehicle_id, customer_id)` could enforce this in the database. It is not used because a vehicle can change owner later, and a past appointment must keep the customer who booked it.
+`ends_at` is the planned end of the work, stored when the appointment is inserted. Editing a service type's duration later never changes old bookings or the load counts used to pick a technician, because both read `ends_at`, not the current service type.
+
+An insert that overlaps an active appointment on the same bay, technician or vehicle fails with SQLSTATE `23P01`, and the error names the constraint, so the service knows which resource clashed. The migration creates `no_vehicle_overlap` first, then `no_tech_overlap`, then `no_bay_overlap`, so a resent request normally fails on the vehicle. The booking service checks that the vehicle belongs to the customer before the insert. A composite foreign key `(vehicle_id, customer_id)` could enforce this in the database. It is not used because a vehicle can change owner later, and a past appointment must keep the customer who booked it.

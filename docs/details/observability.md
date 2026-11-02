@@ -10,7 +10,7 @@ Part of the [system design](../design.md).
 | `level` | `info`, `warning` or `error` |
 | `request_id` | from `X-Request-ID` or generated |
 | `method` | HTTP method |
-| `route` | route template, for example `/appointments/{id}`, not the raw path |
+| `route` | route template, for example `/appointments/{id}`, not the raw path; `unmatched` for a URL with no route |
 | `status` | HTTP status code |
 | `latency_ms` | time spent in the app for this request |
 | `appointment_id` | set when a booking or cancel touches an appointment |
