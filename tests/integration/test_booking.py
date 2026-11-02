@@ -249,3 +249,18 @@ async def test_loop_drops_the_clashing_technician(
     monkeypatch.setattr(repository, "candidate_techs", stale_candidates)
     record = await book(seeded, tue(9), ALIGNMENT, vehicle_id=3, customer_id=2)
     assert (record.technician_id, record.bay_id) == (DAN, ALIGNMENT_BAY)
+
+
+async def test_load_count_uses_stored_work_after_service_type_edit(seeded: AsyncSession) -> None:
+    # only Alice and Dan do general work, so the brake job below must go to Dan
+    async with seeded.begin():
+        await seeded.execute(
+            text("DELETE FROM technician_skill WHERE skill_id = 1 AND technician_id IN (2, 3)")
+        )
+    assert (await book(seeded, tue(9), ALIGNMENT, vehicle_id=1)).technician_id == ALICE  # 60 min
+    assert (await book(seeded, tue(9), BRAKES, vehicle_id=3, customer_id=2)).technician_id == DAN  # 90
+    async with seeded.begin():
+        await seeded.execute(text("UPDATE service_type SET duration_minutes = 120 WHERE id = 4"))
+    # stored load: Alice 60 < Dan 90. Counting the edited duration would give Alice 120.
+    third = await book(seeded, tue(14), ALIGNMENT, vehicle_id=4, customer_id=3)
+    assert third.technician_id == ALICE
