@@ -3,8 +3,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app import errors
 from app.db import make_engine
-from app.routers import health
+from app.routers import appointments, health
 from app.settings import Settings
 
 
@@ -23,3 +24,5 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="Unified Service Scheduler", lifespan=lifespan)
 app.include_router(health.router)
+app.include_router(appointments.router)
+errors.register(app)

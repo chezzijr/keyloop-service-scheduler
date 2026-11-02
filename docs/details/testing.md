@@ -36,5 +36,5 @@ API tests (httpx `AsyncClient` against the app in process, on the same test data
 - Status codes and `problem+json` bodies for 201, 200, 404, 409 and 422, including `reason` and `request_id`.
 - `X-Request-ID` is echoed back when sent and generated when missing.
 - A request to a URL with no route is counted in metrics with `route="unmatched"`.
-- 503 when the database connection is lost (an engine pointing at a closed port), and 503 when a query hits `statement_timeout`.
+- 503 when the database cannot be reached (closed port, unknown host), when a pooled connection was closed by the server (as after a database restart), and when a query hits `statement_timeout`.
 - `/health` returns 200, `/ready` returns 200 with the database up, and `/metrics` lists the metric names from [observability.md](observability.md#metrics).
