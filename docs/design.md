@@ -6,6 +6,7 @@ Status: draft, 2026-11-01. Scenario A (backend implemented, client mocked).
 
 - One FastAPI service + one PostgreSQL 18 database; the client is mocked (OpenAPI UI, cURL, tests).
 - Double-booking is impossible: three Postgres `EXCLUDE` constraints reject any overlap for the same bay, technician or vehicle, even with many API servers.
+- Bookings for one dealership run one at a time, under a Postgres advisory lock. Without it, two parallel inserts can deadlock; the concurrency test found this.
 - The system picks the bay and technician: least-loaded qualified tech, lowest-id bay.
 - A booking reserves planned work time + a 15-min buffer; overruns are handled by the advisor.
 - A vehicle cannot be in two bookings at once, so a resent request gets 409, not a second booking. Cancel frees the slot.
@@ -181,6 +182,7 @@ sequenceDiagram
     alt outside opening hours or crosses local midnight
         S-->>C: 422 reason outside_hours
     end
+    S->>P: pg_advisory_xact_lock(dealership_id)
     S->>P: active appointment for this vehicle overlapping [start, reserved_until)?
     alt vehicle already booked
         S-->>C: 409 vehicle_busy (+ appointment_id)
@@ -213,7 +215,7 @@ sequenceDiagram
 Notes on the loop:
 
 - Why a savepoint. In Postgres, any error inside a transaction aborts the whole transaction. Every later statement fails until a rollback. So each insert attempt runs under its own `SAVEPOINT`. A failed attempt rolls back to that savepoint and the transaction stays usable. Running each attempt in its own short transaction would also work.
-- Pre-filter. The two candidate queries already exclude any tech or bay with an active appointment where `during && tstzrange(start, reserved_until, '[)')`. So in normal use the first insert succeeds. A `23P01` only happens on a real race: another request booked the same tech or bay between our read and our insert.
+- Pre-filter. The two candidate queries already exclude any tech or bay with an active appointment where `during && tstzrange(start, reserved_until, '[)')`. So in normal use the first insert succeeds. The dealership lock (see [Concurrency and Correctness](#concurrency-and-correctness)) stops other bookings for the same dealership from running between our read and our insert. So a `23P01` needs a write the lock does not cover: the same vehicle booked at another dealership at the same moment, or a row written outside this service. The loop stays for those cases, because the constraints, not the lock, are the source of truth.
 - The constraint name in the `23P01` error tells the service which resource clashed. It drops only that tech or that bay and keeps the other.
 - Vehicle clash. A `23P01` on `no_vehicle_overlap` ends the loop at once. Another pair cannot help, because the vehicle itself is booked.
 - Retry bound. Each failed attempt removes one tech or one bay, so no pair is tried twice and the loop ends by itself after at most |T| + |B| attempts. There is no fixed cap: a fixed cap below |T| + |B| could give up while a free pair is left. At dealership scale, |T| + |B| is a few dozen at most.
@@ -244,13 +246,15 @@ Why a database constraint and not application locks or `SELECT ... FOR UPDATE`:
 - A bug in application code cannot double-book. The worst a bug can do is pick a bad candidate, and the insert then fails.
 - Under concurrency, Postgres makes a second insert that overlaps an uncommitted one wait. If the first commits, the second fails with `23P01`. If the first rolls back, the second succeeds. No extra code is needed for this. Checked on `postgres:18` (2026-11-02): an insert started while an overlapping insert was uncommitted waited for it, then failed with `23P01` when it committed. The concurrency tests in Testing Strategy check it again through the API.
 
+Deadlock between inserts, and the dealership lock. The constraints alone are not enough under parallel load. Postgres writes a new row first and then runs each exclusion check, waiting on any overlapping row that is not committed yet. So request P can wait on Q's pending row through `no_tech_overlap` while Q waits on P's pending row through `no_bay_overlap`. Postgres breaks the cycle by failing one of them with `40P01` (deadlock detected), and that client would get a 500. The capacity concurrency test (3 technicians, 3 bays, 10 parallel requests) found this on `postgres:18` (2026-11-02). The fix: after validation, each booking takes `pg_advisory_xact_lock(dealership_id)`, which Postgres releases at commit or rollback. Bookings for one dealership then run one at a time, so no wait cycle can form, and the load count becomes exact. The lock lives in Postgres, so it holds across API instances. It prevents deadlocks, not double-booking: that is still the constraints' job. The cost is no parallel bookings within one dealership; each booking holds the lock for one short transaction. If one dealership ever needs more, the next step is to lock the chosen technician row and then the bay row in a fixed order before each insert.
+
 Half-open ranges. `during` is built with `tstzrange(start, reserved_until, '[)')`. A reserved range ending at 10:00 and one starting at 10:00 do not overlap, so back-to-back bookings in the same bay are allowed once the buffer has passed (Assumptions 15 and 24).
 
 Cancelled rows. Both constraints are partial: `WHERE (status <> 'cancelled')`. A cancelled row stays in the table for history but is ignored by the overlap check. No delete is needed to free a slot.
 
 Resent requests. A client that times out may send the same booking again. Both requests name the same vehicle and time, so `no_vehicle_overlap` lets only one of them in, even when they run at the same moment. The second gets 409 `vehicle_busy` with the id of the first booking, so the client can read it with `GET /appointments/{id}`. This is not a full replay: the client gets a 409, not its original 201. Idempotency keys would give the full replay; they are designed in Out of Scope and Future Work.
 
-Load read. The "booked minutes that local day" used to rank technicians is read without a lock. Two concurrent requests may both pick the same least-loaded technician. This only affects how evenly work is spread. It cannot cause a double-booking, because the insert is still checked by `no_tech_overlap` (Assumption 4).
+Load read. The "booked minutes that local day" used to rank technicians is read under the dealership lock, so two requests cannot both pick the same least-loaded technician from the same count. Even without the lock, a stale count could only affect how evenly work is spread. It cannot cause a double-booking, because the insert is still checked by `no_tech_overlap` (Assumption 4).
 
 Checked against Postgres. A test run on the `postgres:18` Docker image with `btree_gist` and the two constraints gave these results:
 
@@ -316,7 +320,7 @@ This section separates what is built from what is future work.
 Built:
 
 - Stateless API. An API instance keeps no state between requests. Bookings and cancels all live in Postgres. More instances can run behind a load balancer. Each container runs one uvicorn worker, so the in-process Prometheus registry is correct; to scale, add containers, not workers.
-- Correctness at N instances. The rule against double-booking is the three exclusion constraints. They hold no matter how many API instances insert at once, because Postgres checks every insert against all committed and in-progress rows. No lock in the application is needed (see Concurrency and Correctness).
+- Correctness at N instances. The rule against double-booking is the three exclusion constraints. They hold no matter how many API instances insert at once, because Postgres checks every insert against all committed and in-progress rows. Correctness does not depend on the per-dealership advisory lock; that lock prevents deadlocks, and it lives in Postgres, so it also holds across instances (see Concurrency and Correctness).
 - Indexes for overlap queries. Each exclusion constraint creates a GiST index on `(service_bay_id, during)` `(technician_id, during)` or `(vehicle_id, during)`. The candidate queries filter on the same columns with `=` and `&&`, so they can use these indexes and do not scan the whole table.
 - Small query count. A booking runs a fixed number of reads, then usually one insert. There is no N+1 pattern.
 - Connection pool. SQLAlchemy keeps a pool of connections per instance. Its defaults are `pool_size=5` and `max_overflow=10`, so one instance can open up to 15 connections. The rule to keep is: instances x (pool_size + max_overflow) below Postgres `max_connections` (100 by default), with room for migrations and admin access. The values come from settings, not code.

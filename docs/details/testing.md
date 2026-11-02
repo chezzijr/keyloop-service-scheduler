@@ -28,7 +28,7 @@ Integration tests on real Postgres (testcontainers starts `postgres:18`; Alembic
 
 Concurrency tests (real Postgres, real parallel connections):
 
-- One slot, capacity k. Seed k qualified technicians and k compatible bays. Send N > k bookings for the same start at the same time with `asyncio.gather`, each with its own vehicle and its own connection. Expect exactly k responses of 201 and N - k of 409. This holds for any k, because the loop has no fixed attempt cap (see [Data Flow](../design.md#data-flow)). Then query the table and check that no two active rows share a bay or a technician with overlapping `during`.
+- One slot, capacity k. Seed k qualified technicians and k compatible bays. Send N > k bookings for the same start at the same time with `asyncio.gather`, each with its own vehicle and its own connection. Expect exactly k responses of 201 and N - k of 409. This holds for any k, because the loop has no fixed attempt cap (see [Data Flow](../design.md#data-flow)). Then query the table and check that no two active rows share a bay or a technician with overlapping `during`. No request may fail with a deadlock (`40P01`); before the dealership lock, this test found one.
 - Same request twice at once. Seed exactly one qualified technician and one compatible bay, so the losing request has no other candidate. Send the same request twice in parallel. Expect one 201 and one 409 `vehicle_busy` with the first appointment's id, and exactly one row. This checks that the reason does not depend on which index Postgres checks first (see [Data Flow](../design.md#data-flow)).
 
 API tests (httpx `AsyncClient` against the app in process, on the same test database):

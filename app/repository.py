@@ -104,6 +104,16 @@ async def opening_windows(session: AsyncSession, dealership_id: int) -> dict[int
     return {weekday: (opens_at, closes_at) for weekday, opens_at, closes_at in rows}
 
 
+async def lock_dealership(session: AsyncSession, dealership_id: int) -> None:
+    """Run bookings for one dealership one at a time, until this transaction ends.
+
+    Without it two inserts can deadlock (40P01): Postgres writes each new row before it
+    runs the exclusion checks, so request P can wait on Q's pending row through
+    no_tech_overlap while Q waits on P's through no_bay_overlap. The key is the dealership
+    id; this app takes no other advisory locks."""
+    await session.execute(text("SELECT pg_advisory_xact_lock(:id)"), {"id": dealership_id})
+
+
 async def find_vehicle_clash(
     session: AsyncSession, vehicle_id: int, start: datetime, reserved_until: datetime
 ) -> int | None:

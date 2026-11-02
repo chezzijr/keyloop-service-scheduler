@@ -7,7 +7,7 @@ Each line is a decision taken where the brief is silent.
 1. Reference data (dealerships, bays, technicians, skills, service types, customers, vehicles) lives in other Keyloop systems. Here it is seeded by a script; there are no CRUD endpoints for it.
 2. The client does not choose the bay or technician. The system assigns both.
 3. Technician choice: among qualified technicians, pick the least-loaded one. Ties go to the lowest technician id.
-4. Load = sum of booked work minutes (`duration_minutes`, not the buffer) of active appointments for that technician on that local day. It is read without a lock, so it affects fairness only, never correctness.
+4. Load = sum of booked work minutes (`duration_minutes`, not the buffer) of active appointments for that technician on that local day. It is read under the dealership lock, so it is exact; correctness never depends on it (see [Concurrency and Correctness](../design.md#concurrency-and-correctness)).
 5. Bay choice: the compatible bay with the lowest id that is free.
 6. If the insert fails because a bay or technician was taken in the meantime (SQLSTATE `23P01`), the service tries the next candidate pair.
 7. All timestamps are stored as `timestamptz` in UTC. Each dealership has an IANA time zone (for example `Europe/London`) used for opening hours and "local day".

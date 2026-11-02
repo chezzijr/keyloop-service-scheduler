@@ -103,6 +103,9 @@ async def book(session: AsyncSession, req: BookingRequest, *, now: datetime) -> 
                 reason="outside_hours",
             )
 
+        # one booking per dealership at a time: no insert deadlocks, exact load counts
+        await repository.lock_dealership(session, dealership.id)
+
         clash = await repository.find_vehicle_clash(session, req.vehicle_id, start, reserved_until)
         if clash is not None:
             raise _vehicle_busy(clash)
