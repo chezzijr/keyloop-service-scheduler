@@ -1,7 +1,8 @@
 """Request and response bodies (docs/details/api.md)."""
 
-from datetime import datetime
-from typing import Annotated
+from datetime import UTC, datetime, time, timedelta
+from typing import Annotated, Any
+from zoneinfo import ZoneInfo
 
 from pydantic import AwareDatetime, BaseModel, Field
 
@@ -19,6 +20,62 @@ class BookingIn(BaseModel):
     dealership_id: Id
     service_type_id: Id
     start: AwareDatetime  # a start without an offset is a 422, not a guess
+
+
+def example_booking(today: datetime | None = None) -> dict[str, Any]:
+    """A booking on the seed data for the /docs page: brake pads for vehicle 1, on the first
+    weekday at least 7 days ahead, 10:00 London time. Computed when the app starts, so
+    "Try it out" works for a week of uptime and stays inside the 90-day window."""
+    london = ZoneInfo("Europe/London")
+    day = (today or datetime.now(UTC)).astimezone(london).date() + timedelta(days=7)
+    while day.isoweekday() > 5:
+        day += timedelta(days=1)
+    start = datetime.combine(day, time(10), tzinfo=london).astimezone(UTC)
+    return {
+        "customer_id": 1,
+        "vehicle_id": 1,
+        "dealership_id": 1,
+        "service_type_id": 3,
+        "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+class FieldErrorOut(BaseModel):
+    field: str
+    message: str
+
+
+class Problem(BaseModel):
+    """RFC 9457 problem body, as sent by app/errors.py."""
+
+    type: str
+    title: str
+    status: int
+    detail: str
+    instance: str
+    request_id: str | None = None
+    reason: str | None = None  # 409, and 422 outside_hours
+    appointment_id: int | None = None  # 409 vehicle_busy
+    errors: list[FieldErrorOut] | None = None  # 422
+
+
+def problem_responses(*codes: int) -> dict[int | str, dict[str, Any]]:
+    """OpenAPI entries for error codes, documented with the problem+json media type."""
+    descriptions = {
+        404: "Appointment not found",
+        409: "Conflicts with other bookings: reason no_bay, no_technician or vehicle_busy",
+        422: "Invalid request; failing fields in errors",
+        503: "Database unreachable or too slow",
+    }
+    ref = {"$ref": "#/components/schemas/Problem"}
+    return {
+        code: {
+            "model": Problem,
+            "description": descriptions[code],
+            "content": {"application/problem+json": {"schema": ref}},
+        }
+        for code in codes
+    }
 
 
 class Ref(BaseModel):
