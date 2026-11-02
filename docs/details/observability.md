@@ -19,7 +19,7 @@ Part of the [system design](../design.md).
 
 ## Label cardinality
 
-Label cardinality. Labels only take values from a small, fixed set: route templates, methods, status codes, reasons and dealership ids. Customer ids, vehicle ids, appointment ids and request ids are never labels. Each new label value creates a new time series in Prometheus, so an unbounded id would grow memory without limit. Those ids belong in logs.
+Label cardinality. Labels only take values from a small, fixed set: route templates (`unmatched` for a URL with no route), the standard HTTP methods (any other method the client sends is labelled `other`), status codes, reasons and dealership ids. Customer ids, vehicle ids, appointment ids and request ids are never labels. Each new label value creates a new time series in Prometheus, so an unbounded id would grow memory without limit. Those ids belong in logs.
 
 ## Traces (designed, not built)
 

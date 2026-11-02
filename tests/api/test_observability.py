@@ -220,3 +220,12 @@ async def test_log_line_is_json_on_stdout(
     assert line["status"] == 200
     assert datetime.fromisoformat(line["ts"]).utcoffset().total_seconds() == 0
     assert {"method", "latency_ms"} <= line.keys()
+
+
+async def test_unknown_http_method_is_labelled_other(client: AsyncClient) -> None:
+    # the method comes from the client; a free-form label would grow without limit
+    labels = {"route": "/health", "method": "other", "status": "405"}
+    before = sample("http_request_duration_seconds_count", **labels)
+    assert (await client.request("BREW", "/health")).status_code == 405
+    assert sample("http_request_duration_seconds_count", **labels) == before + 1
+    assert 'method="BREW"' not in (await client.get("/metrics")).text

@@ -10,6 +10,8 @@ from prometheus_client import Counter, Histogram
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 REQUEST_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
+# the method comes from the client, so any other value is labelled "other" (fixed label set)
+METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
 
 REQUEST_DURATION = Histogram(
     "http_request_duration_seconds",
@@ -79,7 +81,8 @@ class RequestMiddleware:
                 route: Any = scope.get("route")
                 template = getattr(route, "path", None) or "unmatched"
                 method = scope["method"]
-                REQUEST_DURATION.labels(template, method, str(status)).observe(elapsed)
+                method_label = method if method in METHODS else "other"
+                REQUEST_DURATION.labels(template, method_label, str(status)).observe(elapsed)
                 log.info(
                     "request",
                     method=method,
