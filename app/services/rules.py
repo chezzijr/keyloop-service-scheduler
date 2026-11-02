@@ -29,8 +29,11 @@ def compute_times(start: datetime, duration_min: int, buffer_min: int) -> tuple[
 
 def check_start(start: datetime, now: datetime) -> list[FieldError]:
     """15-minute grid in UTC with zero seconds (A8); not in the past, at most 90 days ahead (A14)."""
+    try:
+        start_utc = start.astimezone(UTC)
+    except OverflowError:  # e.g. 0001-01-01T00:00+01:00 is before year 1 in UTC
+        return [FieldError("start", "is outside the supported date range")]
     errors = []
-    start_utc = start.astimezone(UTC)
     if start_utc.minute % GRID_MINUTES or start_utc.second or start_utc.microsecond:
         errors.append(
             FieldError("start", "must be on the 15-minute grid in UTC, with zero seconds")

@@ -1,6 +1,6 @@
 """Pure booking rules: no database, no HTTP."""
 
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -165,3 +165,15 @@ def test_local_day_bounds_uses_local_date() -> None:
 )
 def test_pick_reason(vehicle_busy: bool, techs_empty: bool, reason: str) -> None:
     assert pick_reason(vehicle_busy=vehicle_busy, techs_empty=techs_empty) == reason
+
+
+@pytest.mark.parametrize(
+    "start",
+    [
+        datetime(1, 1, 1, 0, 0, tzinfo=timezone(timedelta(hours=1))),  # UTC would be year 0
+        datetime(9999, 12, 31, 23, 0, tzinfo=timezone(timedelta(hours=-2))),  # UTC: year 10000
+    ],
+    ids=["before-year-1-in-utc", "after-year-9999-in-utc"],
+)
+def test_start_outside_the_datetime_range_is_a_field_error(start: datetime) -> None:
+    assert check_start(start, NOW) == [FieldError("start", "is outside the supported date range")]
