@@ -1,0 +1,42 @@
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: scheduler
+      POSTGRES_PASSWORD: scheduler
+      POSTGRES_DB: scheduler
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scheduler -d scheduler"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  api:
+    build: .
+    image: service-scheduler
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scheduler:scheduler@db:5432/scheduler
+    depends_on:
+      db:
+        condition: service_healthy
+    # migrations run before the API starts
+    command: ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1"]
+    ports:
+      - "8000:8000"
+
+  # one-off: docker compose run --rm seed (migrates first, so it works before the api is up)
+  seed:
+    build: .
+    image: service-scheduler
+    profiles: ["tools"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scheduler:scheduler@db:5432/scheduler
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["sh", "-c", "alembic upgrade head && python -m scripts.seed"]
+
+volumes:
+  pgdata:
