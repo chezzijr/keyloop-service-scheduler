@@ -14,12 +14,12 @@ Part of the [system design](../design.md).
 | `status` | HTTP status code |
 | `latency_ms` | time spent in the app for this request |
 | `appointment_id` | set when a booking or cancel touches an appointment |
-| `reason` | set on a 409 (`no_bay`, `no_technician`, `idempotency_key_reused`) or a 422 `outside_hours` |
+| `reason` | set on a 409 (`no_bay`, `no_technician`, `vehicle_busy`) or a 422 `outside_hours` |
 | `attempts` | number of insert attempts in the booking loop (1 to \|T\| + \|B\|) |
 
 ## Label cardinality
 
-Label cardinality. Labels only take values from a small, fixed set: route templates, methods, status codes, reasons and dealership ids. Customer ids, vehicle ids, appointment ids, idempotency keys and request ids are never labels. Each new label value creates a new time series in Prometheus, so an unbounded id would grow memory without limit. Those ids belong in logs.
+Label cardinality. Labels only take values from a small, fixed set: route templates, methods, status codes, reasons and dealership ids. Customer ids, vehicle ids, appointment ids and request ids are never labels. Each new label value creates a new time series in Prometheus, so an unbounded id would grow memory without limit. Those ids belong in logs.
 
 ## Traces (designed, not built)
 
@@ -32,7 +32,7 @@ Metrics:
 | Metric | Type | Labels | What it shows |
 |---|---|---|---|
 | `http_request_duration_seconds` | histogram | `route`, `method`, `status` | request rate, error rate and latency per endpoint |
-| `appointments_booked_total` | counter | `dealership_id` | successful bookings (201 only, not replays) |
+| `appointments_booked_total` | counter | `dealership_id` | successful bookings (201 only) |
 | `booking_rejected_total` | counter | `reason` | 409 responses by reason |
 | `booking_insert_attempts` | histogram | none | insert attempts per booking; a value above 1 means a race was lost |
 | `appointments_cancelled_total` | counter | none | cancels that changed a row |
@@ -43,7 +43,7 @@ Example alerts. These are written as rules a Prometheus setup would run. No aler
 
 | Alert | Condition (example) | Why |
 |---|---|---|
-| Rejection rate by reason | `booking_rejected_total{reason="no_technician"}` above 30% of booking requests over 30 minutes | Dealership is short of qualified staff, or seed data or shifts are wrong. Split by reason tells a staff shortage apart from a bay shortage. |
+| Rejection rate by reason | `booking_rejected_total{reason="no_technician"}` above 30% of booking requests over 30 minutes | Dealership is short of qualified staff, or seed data is wrong. Split by reason tells a staff shortage apart from a bay shortage. |
 | Slow bookings | p95 of `http_request_duration_seconds{route="/appointments",method="POST"}` above 500 ms for 10 minutes | Database slow, pool exhausted, or long lock waits. |
 | Contention | share of bookings with `booking_insert_attempts` above 1 grows above 5% | Many requests race for the same slots. A sign to look at hot dealerships before users see more 409s. |
 | Not ready | `/ready` failing on any instance for 2 minutes | Database unreachable from that instance. |

@@ -15,7 +15,6 @@ erDiagram
     SKILL ||--o{ TECHNICIAN_SKILL : "held via"
     SKILL ||--o{ SERVICE_TYPE : "required by"
     TECHNICIAN ||--o{ TECHNICIAN_SKILL : has
-    TECHNICIAN ||--o{ TECHNICIAN_SHIFT : works
     TECHNICIAN ||--o{ APPOINTMENT : "assigned to"
     SERVICE_BAY ||--o{ APPOINTMENT : "assigned to"
     SERVICE_TYPE ||--o{ APPOINTMENT : "booked as"
@@ -78,12 +77,6 @@ erDiagram
         time opens_at "local"
         time closes_at "local"
     }
-    TECHNICIAN_SHIFT {
-        bigint technician_id PK, FK
-        smallint weekday PK "ISO 1-7"
-        time starts_at "local"
-        time ends_at "local"
-    }
     APPOINTMENT {
         bigint id PK
         bigint customer_id FK
@@ -94,8 +87,6 @@ erDiagram
         bigint technician_id FK
         tstzrange during "half-open, start to end + buffer"
         text status "confirmed or cancelled"
-        text idempotency_key UK
-        text request_hash "SHA-256 of body"
         timestamptz created_at
         timestamptz cancelled_at "null unless cancelled"
     }
