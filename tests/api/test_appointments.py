@@ -251,3 +251,16 @@ async def test_dropped_pooled_connection_is_503(
             )
         )
     assert_problem(await seeded.get("/appointments/1"), 503)
+
+
+@pytest.mark.parametrize("bad_id", [0, -1, 2**63])
+async def test_body_id_out_of_bigint_range_is_422(seeded: AsyncClient, bad_id: int) -> None:
+    problem = assert_problem(await seeded.post("/appointments", json=body() | {"customer_id": bad_id}), 422)
+    assert [e["field"] for e in problem["errors"]] == ["customer_id"]
+
+
+@pytest.mark.parametrize("path", ["/appointments/9223372036854775808", "/appointments/0/cancel"])
+async def test_path_id_out_of_bigint_range_is_422(seeded: AsyncClient, path: str) -> None:
+    method = seeded.post if path.endswith("/cancel") else seeded.get
+    problem = assert_problem(await method(path), 422)
+    assert [e["field"] for e in problem["errors"]] == ["appointment_id"]
