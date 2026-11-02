@@ -15,8 +15,9 @@ Ids that scripts/demo.sh and the tests rely on:
                    4 wheel_alignment 60+15 (alignment bay, alignment skill)
                    5 mot_test 60+15 (mot_lane bay, mot_tester skill)
                    6 ev_battery_check 60+15 (lift bay, ev_hv skill)
-    customer       1 Emma Clarke, 2 Oliver Bennett, 3 Sophie Turner
-    vehicle        1, 2 (customer 1); 3 (customer 2); 4 (customer 3)
+    customer       1 Emma Clarke, 2 Oliver Bennett, 3 Sophie Turner, 4 Northside Fleet
+    vehicle        1, 2 (customer 1); 3 (customer 2); 4 (customer 3); 5-14 (customer 4,
+                   fleet cars for scripts/race.sh)
 
 Demo cases this allows:
     no_technician  two MOT tests (or two EV checks) at the same time: one qualified technician.
@@ -113,6 +114,7 @@ async def seed(conn: AsyncConnection) -> None:
                 {"name": "Emma Clarke", "email": "emma.clarke@example.com"},
                 {"name": "Oliver Bennett", "email": "oliver.bennett@example.com"},
                 {"name": "Sophie Turner", "email": "sophie.turner@example.com"},
+                {"name": "Northside Fleet", "email": "fleet@example.com"},
             ],
         ),
         (
@@ -125,6 +127,10 @@ async def seed(conn: AsyncConnection) -> None:
                     (2, "WVWZZZAUZLW123456", "Volkswagen", "Golf"),
                     (3, "SALGA2AE7KA123456", "Land Rover", "Range Rover"),
                 ]
+            ]
+            + [
+                {"customer_id": 4, "vin": f"FLEET{n:012d}", "make": "Ford", "model": "Transit"}
+                for n in range(1, 11)
             ],
         ),
     ]

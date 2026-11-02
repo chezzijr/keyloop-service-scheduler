@@ -4,6 +4,8 @@ A backend API that books service appointments and checks that a service bay and 
 
 Design: [docs/design.md](docs/design.md)
 
+Reviewer walkthrough and video script: [docs/demo.md](docs/demo.md)
+
 ## Prerequisites
 
 - Docker with the compose plugin, to run the API and Postgres.
@@ -26,6 +28,14 @@ Run the demo story with cURL:
 ```
 
 It books an appointment, reads it, shows a `vehicle_busy` and a `no_technician` conflict, cancels the first booking and books its slot again. Each step prints the HTTP status, and the script stops with exit code 1 if a status is not the expected one. The slot is the next weekday at least 2 days ahead, 10:00 London time. Set `START` (UTC, on the 15-minute grid, inside opening hours) to use another slot, for example `START=2026-11-10T10:00:00Z ./scripts/demo.sh`. The demo needs fresh seed data: a second run on the same slot stops at step 1 and prints how to reset.
+
+Show that parallel requests never double-book:
+
+```
+./scripts/race.sh
+```
+
+It sends 10 oil-change bookings at the same moment for 3 free lifts, expects exactly 3 `201` and 7 `409`, then asks Postgres whether any bay or technician is double-booked (expected `0`). Its slot is 14:00 London time, so it does not clash with `demo.sh`.
 
 Stop and delete the data:
 
