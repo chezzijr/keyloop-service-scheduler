@@ -37,7 +37,7 @@ Each line is a decision taken where the brief is silent.
 1. Reference data (dealerships, bays, technicians, skills, service types, customers, vehicles) lives in other Keyloop systems. Here it is seeded by a script; there are no CRUD endpoints for it.
 2. The client does not choose the bay or technician. The system assigns both.
 3. Technician choice: among qualified technicians on shift, pick the least-loaded one. Ties go to the lowest technician id.
-4. Load = sum of booked minutes of active appointments for that technician on that local day. It is read without a lock, so it affects fairness only, never correctness.
+4. Load = sum of booked work minutes (`duration_minutes`, not the buffer) of active appointments for that technician on that local day. It is read without a lock, so it affects fairness only, never correctness.
 5. Bay choice: the compatible bay with the lowest id that is free.
 6. If the insert fails because a bay or technician was taken in the meantime (SQLSTATE `23P01`), the service tries the next candidate pair.
 7. All timestamps are stored as `timestamptz` in UTC. Each dealership has an IANA time zone (for example `Europe/London`) used for opening hours, shifts and "local day".
@@ -48,14 +48,14 @@ Each line is a decision taken where the brief is silent.
 12. Dealership opening hours and technician shifts are a weekly pattern: weekday (ISO, 1 = Monday) with a local start and end time, one window per weekday (no split shifts). So lunch breaks are not modelled: a technician counts as available for the whole shift. The 15-minute buffer (Assumption 24) is slack for overruns, not a break, because an overrun uses it up. There are no holidays, closures or one-off exceptions.
 13. The work part `[start, end)` must fall inside the dealership's opening hours and inside the assigned technician's shift for that weekday. The buffer (Assumption 24) may run past closing time. An appointment does not cross midnight local time.
 14. Booking window: the start must not be in the past and must be at most 90 days ahead.
-15. Time ranges are half-open `[start, end)`. An appointment ending at 10:00 does not conflict with one starting at 10:00.
+15. Time ranges are half-open. The overlap rules use the reserved range `[start, reserved_until)` (work + buffer, Assumption 24). A reserved range ending at 10:00 does not conflict with one starting at 10:00.
 16. The vehicle must belong to the customer in the request.
-17. A booking that cannot be placed returns 409 with a `reason`: `no_bay`, `no_technician`, `outside_hours` or `idempotency_key_reused`.
+17. A booking that conflicts with other bookings returns 409 with a `reason`: `no_bay`, `no_technician` or `idempotency_key_reused`. A start outside opening hours returns 422 with `reason: outside_hours`, because it depends on configuration, not on other bookings, so retrying can never succeed.
 18. Idempotency: `POST /appointments` requires an `Idempotency-Key` header. The key is stored in a UNIQUE `idempotency_key` column with a `request_hash` (SHA-256 of the canonical JSON body).
 19. Same key and same body returns 200 with the original appointment. Same key and a different body returns 409 `idempotency_key_reused`.
 20. Cancel sets `status = cancelled` and `cancelled_at`; the row is kept. Cancelled rows no longer block the bay or technician. Cancelling an already cancelled appointment returns 200 with the same record.
 21. Errors use RFC 9457 `application/problem+json`.
-22. Request validation errors return 422. This covers an off-grid start, a start in the past, a start more than 90 days ahead, a vehicle not owned by the customer, unknown reference ids and a missing `Idempotency-Key`.
+22. Request validation errors return 422. This covers an off-grid start, a start in the past, a start more than 90 days ahead, work outside opening hours (`reason: outside_hours`), a vehicle not owned by the customer, unknown reference ids and a missing `Idempotency-Key`. A request whose key was already used gets its replay before these checks run (see Data Flow).
 23. There is no authentication or authorisation in this service. An API gateway in front of it is assumed to handle that.
 24. Nobody knows in advance how long a real repair takes. Workshops book against a planned duration: a standard labour time per job. So `duration_minutes` is planned time, and each service type also has `buffer_minutes` (default 15, a multiple of 15) as slack for small overruns. The bay and technician are reserved for `[start, start + duration + buffer)`. This range is what `during` stores and what the overlap rules check. The API returns both `end` (planned end of work) and `reserved_until` (end of the buffer).
 25. The system stores the plan only. If a job overruns past its buffer, nothing moves automatically. The service advisor (the person who manages bookings at the front desk) tells the next customer, or cancels and rebooks. See "Operational delays" in Data Flow.
@@ -235,6 +235,20 @@ ALTER TABLE appointment
   ADD CONSTRAINT no_tech_overlap
   EXCLUDE USING gist (technician_id WITH =, during WITH &&)
   WHERE (status <> 'cancelled');
+
+-- the overlap rules depend on status, so a typo like 'canceled' must be impossible
+ALTER TABLE appointment
+  ADD CONSTRAINT status_valid CHECK (status IN ('confirmed', 'cancelled'));
+
+-- the bay and technician must belong to the appointment's dealership
+-- (service_bay and technician each get UNIQUE (id, dealership_id) for this)
+ALTER TABLE appointment
+  ADD CONSTRAINT bay_in_dealership
+  FOREIGN KEY (service_bay_id, dealership_id) REFERENCES service_bay (id, dealership_id);
+
+ALTER TABLE appointment
+  ADD CONSTRAINT tech_in_dealership
+  FOREIGN KEY (technician_id, dealership_id) REFERENCES technician (id, dealership_id);
 ```
 
 An insert that overlaps an active appointment on the same bay or technician fails with SQLSTATE `23P01`, and the error names the constraint, so the service knows which resource clashed. The booking service checks that the vehicle belongs to the customer before the insert. A composite foreign key `(vehicle_id, customer_id)` could enforce this in the database. It is not used because a vehicle can change owner later, and a past appointment must keep the customer who booked it.
@@ -308,7 +322,7 @@ Content-Type: application/problem+json
   "type": "https://example.com/problems/booking-conflict",
   "title": "Appointment cannot be booked",
   "status": 409,
-  "detail": "No technician with skill ev_hv is free from 09:00 to 10:30 UTC on 2026-11-10.",
+  "detail": "No technician with skill ev_hv is free from 09:00 to 10:15 UTC on 2026-11-10 (EV battery health check: 60 min work + 15 min buffer).",
   "instance": "/appointments",
   "reason": "no_technician",
   "request_id": "b7e4c1d2a9f0"
@@ -320,15 +334,15 @@ Status codes:
 - `201 Created`: appointment booked.
 - `200 OK`: idempotent replay of a booking, a read, a cancel, or an availability result.
 - `404 Not Found`: appointment id does not exist.
-- `409 Conflict`: the request is valid but cannot be placed. `reason` is one of `no_bay`, `no_technician`, `outside_hours`, `idempotency_key_reused`.
-- `422 Unprocessable Content`: validation failed. Examples: start not on the 15-minute grid, start in the past, start more than 90 days ahead, vehicle not owned by the customer, unknown reference id, missing `Idempotency-Key`. The problem body lists the failing fields in `errors`.
+- `409 Conflict`: the request is valid but conflicts with other bookings. `reason` is one of `no_bay`, `no_technician`, `idempotency_key_reused`.
+- `422 Unprocessable Content`: validation failed. Examples: start not on the 15-minute grid, start in the past, start more than 90 days ahead, work outside opening hours (`reason: outside_hours`), vehicle not owned by the customer, unknown reference id, missing `Idempotency-Key`. The problem body lists the failing fields in `errors`.
 - `503 Service Unavailable`: `/ready` when the database cannot be reached, or any request whose query hits the database `statement_timeout` (see Scalability, Performance and Reliability).
 
 All error bodies use RFC 9457 `application/problem+json` with `type`, `title`, `status`, `detail`, `instance`, plus `reason` for 409 and `request_id` for tracing.
 
 ## Data Flow
 
-This is the path of `POST /appointments`. Steps run in one database transaction, except the read-only checks before it.
+This is the path of `POST /appointments`. After the body is parsed, everything runs in one database transaction that starts by locking the idempotency key.
 
 ```mermaid
 sequenceDiagram
@@ -338,31 +352,33 @@ sequenceDiagram
     participant P as Postgres
 
     C->>A: POST /appointments + Idempotency-Key
-    A->>A: validate body, 15-min grid, booking window
-    alt invalid body, off grid, past or over 90 days, no key
+    A->>A: parse JSON body, require Idempotency-Key
+    alt malformed body or no key
         A-->>C: 422 problem+json (errors)
     end
     A->>S: book(request, key, request_hash)
+    S->>P: BEGIN
+    S->>P: pg_advisory_xact_lock(hashtext(key))
     S->>P: SELECT appointment WHERE idempotency_key = key
     alt key found, same request_hash
         S-->>C: 200 original appointment (replay)
     else key found, different request_hash
         S-->>C: 409 idempotency_key_reused
     end
+    S->>S: check 15-min grid and booking window (not past, max 90 days)
     S->>P: load dealership, service type, customer, vehicle
-    alt unknown id or vehicle not owned by customer
+    alt off grid, past, over 90 days, unknown id or vehicle not owned
         S-->>C: 422 problem+json (errors)
     end
     S->>S: end = start + duration, reserved_until = end + buffer
     S->>S: check work [start, end) inside opening hours (dealership tz)
     alt outside opening hours or crosses local midnight
-        S-->>C: 409 outside_hours
+        S-->>C: 422 reason outside_hours
     end
-    S->>P: qualified techs on shift covering [start, end), free for [start, reserved_until), sorted by booked minutes that local day, then id
+    S->>P: qualified techs on shift covering [start, end), free for [start, reserved_until), sorted by booked work minutes that local day, then id
     S->>P: compatible bays free for [start, reserved_until), sorted by id
     P-->>S: tech list T, bay list B
-    S->>P: BEGIN
-    loop while T and B not empty and attempts < 10
+    loop while T and B not empty
         S->>P: SAVEPOINT attempt
         S->>P: INSERT appointment (first tech of T, first bay of B)
         alt insert ok
@@ -385,8 +401,10 @@ Notes on the loop:
 - Why a savepoint. In Postgres, any error inside a transaction aborts the whole transaction. Every later statement fails until a rollback. So each insert attempt runs under its own `SAVEPOINT`. A failed attempt rolls back to that savepoint and the transaction stays usable. Running each attempt in its own short transaction would also work.
 - Pre-filter. The two candidate queries already exclude any tech or bay with an active appointment where `during && tstzrange(start, reserved_until, '[)')`. So in normal use the first insert succeeds. A `23P01` only happens on a real race: another request booked the same tech or bay between our read and our insert.
 - The constraint name in the `23P01` error tells the service which resource clashed. It drops only that tech or that bay and keeps the other.
-- Retry bound. Each failed attempt removes one tech or one bay, so no pair is tried twice. The loop also stops after 10 attempts. Then the service returns 409.
-- Reason when no pair succeeds. If the tech list is empty, the reason is `no_technician`, even if the bays are also full. Otherwise the reason is `no_bay`. This order is an assumption: a qualified technician is usually harder to find than a free bay, so it is the more useful thing to tell the advisor. If the 10-attempt cap ends the loop with both lists non-empty, the reason names the resource of the last `23P01`.
+- Key lock first. `pg_advisory_xact_lock(hashtext(key))` makes requests with the same key run one after another. The second one waits until the first commits, then its lookup finds the row and replays it. Without the lock, the result of a same-key race would depend on which index Postgres checks first (see Concurrency and Correctness). The lock is released at commit or rollback. Two different keys that hash to the same number only wait for each other; they never share data.
+- Replay before validation. The key lookup runs before the time checks, so a client that retries after the start time has passed still gets its original answer, not a 422.
+- Retry bound. Each failed attempt removes one tech or one bay, so no pair is tried twice and the loop ends by itself after at most |T| + |B| attempts. There is no fixed cap: a fixed cap below |T| + |B| could give up while a free pair is left. At dealership scale, |T| + |B| is a few dozen at most.
+- Reason when no pair succeeds. If the tech list is empty, the reason is `no_technician`, even if the bays are also full. Otherwise the reason is `no_bay`. This order is an assumption: a qualified technician is usually harder to find than a free bay, so it is the more useful thing to tell the advisor.
 
 Cancel flow (`POST /appointments/{id}/cancel`): the service runs `UPDATE appointment SET status = 'cancelled', cancelled_at = now() WHERE id = :id AND status = 'confirmed'`. The exclusion constraints have `WHERE (status <> 'cancelled')`, so the row stops counting at once and the bay and technician are free for new bookings. If the row is already cancelled, the update touches nothing and the service returns 200 with the stored record. An unknown id returns 404.
 
@@ -411,13 +429,13 @@ Why a database constraint and not application locks or `SELECT ... FOR UPDATE`:
 - It holds across any number of API instances. An in-process lock only covers one process. A distributed lock adds a new component that can fail.
 - `SELECT ... FOR UPDATE` can only lock rows that exist. A free time slot has no row to lock, so two requests can both see "free" and both insert. Locking the bay and technician rows instead works, but every code path must take the locks in the same order or it can deadlock.
 - A bug in application code cannot double-book. The worst a bug can do is pick a bad candidate, and the insert then fails.
-- Under concurrency, Postgres makes a second insert that overlaps an uncommitted one wait. If the first commits, the second fails with `23P01`. If the first rolls back, the second succeeds. No extra code is needed for this. This is documented Postgres behaviour, not yet run here; the concurrency test in Testing Strategy checks it.
+- Under concurrency, Postgres makes a second insert that overlaps an uncommitted one wait. If the first commits, the second fails with `23P01`. If the first rolls back, the second succeeds. No extra code is needed for this. Checked on `postgres:18` (2026-11-02): an insert started while an overlapping insert was uncommitted waited for it, then failed with `23P01` when it committed. The concurrency tests in Testing Strategy check it again through the API.
 
 Half-open ranges. `during` is built with `tstzrange(start, reserved_until, '[)')`. A reserved range ending at 10:00 and one starting at 10:00 do not overlap, so back-to-back bookings in the same bay are allowed once the buffer has passed (Assumptions 15 and 24).
 
 Cancelled rows. Both constraints are partial: `WHERE (status <> 'cancelled')`. A cancelled row stays in the table for history but is ignored by the overlap check. No delete is needed to free a slot.
 
-Idempotency race. Two requests with the same `Idempotency-Key` can arrive at once. Both find no row in the lookup and both try to insert. The `idempotency_key` UNIQUE index makes the second insert wait for the first. When the first commits, the second fails with SQLSTATE `23505`. This holds on every attempt of the loop, because each attempt inserts the same key, so a retry on another pair cannot slip a duplicate past it. On `23505` the service rolls back, reads the existing row, and compares `request_hash`. Same hash returns 200 with that row. A different hash returns 409 `idempotency_key_reused`.
+Idempotency race. Two requests with the same `Idempotency-Key` can arrive at once. Without extra care, both find no row in the lookup and both try to insert the same bay and technician. Which error the second insert gets then depends on the order Postgres checks the indexes, which is the order they were created. A test on `postgres:18` (2026-11-02) showed both outcomes: `23505` (duplicate key) when the UNIQUE index came first, `23P01` (overlap) when the exclusion constraint came first. With `23P01`, the loop drops that technician; with no other candidate left, the client gets 409 `no_technician` instead of a 200 replay. So the design does not rely on index order. The transaction takes `pg_advisory_xact_lock(hashtext(key))` before the lookup. The second request waits, then finds the committed row and replays it (or returns 409 `idempotency_key_reused` if `request_hash` differs). The UNIQUE index on `idempotency_key` stays as a safety net: if a `23505` still happens, the service rolls back, reads the row and replays it.
 
 Load read. The "booked minutes that local day" used to rank technicians is read without a lock. Two concurrent requests may both pick the same least-loaded technician. This only affects how evenly work is spread. It cannot cause a double-booking, because the insert is still checked by `no_tech_overlap` (Assumption 4).
 
@@ -479,7 +497,7 @@ Versions are the ones installed and imported on Python 3.14 on 2026-11-01.
 
 Two signals are built: logs and metrics. Logs carry the `request_id`. Traces are designed but not built (see Traces below).
 
-Request id. The middleware reads the `X-Request-ID` header. If it is missing, it creates a new random id. The id is bound to the log context for the request, returned in the `X-Request-ID` response header, and put in the `request_id` field of every problem body (see API). A client or support person can quote it and find every log line of that request.
+Request id. The middleware reads the `X-Request-ID` header. It accepts the value only if it is at most 64 characters of `[A-Za-z0-9._-]`, because the value goes into logs and response headers. If it is missing or invalid, it creates a new random id. The id is bound to the log context for the request, returned in the `X-Request-ID` response header, and put in the `request_id` field of every problem body (see API). A client or support person can quote it and find every log line of that request.
 
 Logs. structlog writes one JSON object per line to stdout. The container platform collects stdout, so the app does not manage log files. Each request ends with one access line. Booking adds one line with its outcome.
 
@@ -493,8 +511,8 @@ Logs. structlog writes one JSON object per line to stdout. The container platfor
 | `status` | HTTP status code |
 | `latency_ms` | time spent in the app for this request |
 | `appointment_id` | set when a booking or cancel touches an appointment |
-| `reason` | set on a 409: `no_bay`, `no_technician`, `outside_hours`, `idempotency_key_reused` |
-| `attempts` | number of insert attempts in the booking loop (1 to 10) |
+| `reason` | set on a 409 (`no_bay`, `no_technician`, `idempotency_key_reused`) or a 422 `outside_hours` |
+| `attempts` | number of insert attempts in the booking loop (1 to \|T\| + \|B\|) |
 
 Request bodies are not logged, so customer names and emails stay out of the logs.
 
@@ -551,26 +569,28 @@ Unit tests (no database, fast):
 - Buffer near closing: a job whose work ends exactly at closing time is accepted even though its buffer runs past it.
 - Request validation: a start off the 15-minute grid, with seconds, in the past, or more than 90 days ahead is rejected with 422. The clock is injected, so tests do not depend on today's date.
 - Slot generation for one local date: the first and last start inside opening hours, a service longer than the window gives no slots, and a closed weekday gives an empty list.
-- DST: slot generation in `Europe/London` on 2026-10-25, the day clocks go back. Opening at 08:00 local is 07:00 UTC on 2026-10-24 and 08:00 UTC on 2026-10-25. The test checks the UTC starts of both days. The clock is fixed to a date before them, so the past-start rule does not drop the slots.
-- Reason precedence: empty tech list gives `no_technician` even when bays are also empty. Empty bay list only gives `no_bay`. Cap reached with both lists non-empty gives the resource of the last `23P01`.
+- DST: slot generation in `Europe/London` on 2026-10-25 (a Sunday), the day clocks go back. The test passes its own Sunday opening window to the slot function, so it does not depend on seed data. Opening at 08:00 local is 07:00 UTC on 2026-10-24 and 08:00 UTC on 2026-10-25. The test checks the UTC starts of both days. The clock is fixed to a date before them, so the past-start rule does not drop the slots.
+- Reason precedence: empty tech list gives `no_technician` even when bays are also empty. Empty bay list only gives `no_bay`. 
 
 Integration tests on real Postgres (testcontainers starts `postgres:18`; Alembic builds the schema; each test runs in a clean state):
 
 - Bay overlap: a second booking that overlaps in the same bay with a different technician fails with `no_bay_overlap`.
 - Technician overlap: a second booking for the same technician in a different bay fails with `no_tech_overlap`.
-- Touching ranges: `[10:00, 11:30)` and `[11:30, 12:00)` on the same bay and technician both succeed.
+- Touching reserved ranges: a 60-min job at 10:00 (reserved until 11:15, work + buffer) and a booking at 11:15 for the same bay and technician both succeed.
 - Buffer blocks: after a 90-min job at 09:00 (reserved until 10:45), a booking for the same technician at 10:30 is refused and one at 10:45 succeeds.
 - Cancel frees the slot: book, cancel, then book the same slot again and get 201. Cancelling twice returns 200 with the same record.
 - Idempotent replay: the same key and body returns 200 with the same appointment id, and the table still has one row. The same key with a different body returns 409 `idempotency_key_reused`.
 - Least-loaded pick: with two qualified technicians and one already booked for 2 hours that day, the booking goes to the other one. With equal load, it goes to the lower id.
-- `outside_hours`: a booking that starts before opening or ends after closing returns 409 `outside_hours`.
+- `outside_hours`: a booking that starts before opening or whose work ends after closing returns 422 with `reason: outside_hours`.
+- Late retry: a booking replayed with the same key after its start time has passed returns 200 with the original, not 422.
+- Database guards: inserting a status other than `confirmed` or `cancelled` fails on `status_valid`; a bay from another dealership fails on `bay_in_dealership`.
 - Shifts: a booking inside opening hours but outside every qualified technician's shift returns 409 `no_technician`.
 - Vehicle ownership: a vehicle that belongs to another customer returns 422.
 
 Concurrency tests (real Postgres, real parallel connections):
 
-- One slot, capacity k. Seed k qualified technicians and k compatible bays. Send N > k bookings for the same start at the same time with `asyncio.gather`, each with its own key and its own connection. Expect exactly k responses of 201 and N - k of 409. Then query the table and check that no two active rows share a bay or a technician with overlapping `during`.
-- Same key twice at once. Send two identical requests with the same `Idempotency-Key` in parallel. Expect one 201 and one 200 with the same appointment id, and exactly one row. This test and the one above check the Postgres wait behaviour described in Concurrency and Correctness, which is documented but not yet run in this project.
+- One slot, capacity k. Seed k qualified technicians and k compatible bays. Send N > k bookings for the same start at the same time with `asyncio.gather`, each with its own key and its own connection. Expect exactly k responses of 201 and N - k of 409. This holds for any k, because the loop has no fixed attempt cap (see Data Flow). Then query the table and check that no two active rows share a bay or a technician with overlapping `during`.
+- Same key twice at once. Seed exactly one qualified technician and one compatible bay, so a lost race has no other candidate to fall back to. Send two identical requests with the same `Idempotency-Key` in parallel. Expect one 201 and one 200 with the same appointment id, and exactly one row. This is the case that returned 409 before the key lock was added (see Concurrency and Correctness).
 
 API tests (httpx `AsyncClient` against the app in process, on the same test database):
 
@@ -590,7 +610,7 @@ How I worked with the AI:
 
 - Plan first. The AI asked me multiple-choice questions, each option with its trade-off. It wrote `research.md` and `plan.md` outside the repo and built nothing until I approved the plan.
 - The build was split into tasks. A separate subagent drafted each section of this document. The orchestrating AI read every draft against the plan and fixed it before my review.
-- Each subagent listed every assumption it added on its own, so I can accept or change each one. My review of those lists is still pending.
+- Each subagent listed every assumption it added on its own. I reviewed every list: I questioned Assumptions 12 and 22, turned lunch breaks into a stated limitation, and kept the rest.
 
 What I decided and what the AI proposed:
 
@@ -610,12 +630,18 @@ Caught by me, while reading the draft:
 
 - The draft assumed every service has a known end time. I asked three questions. How can a repair have an end time when nobody can measure it in advance? What about cars that stay in the workshop for several days? If a job overruns, what happens to the next appointment, and do delays push all later bookings? None of this was in the draft. The AI then explained how workshops plan with standard labour times. It proposed four ways to handle overruns: manual handling, a buffer, a reassign endpoint, and an automatic push. I chose manual handling plus a buffer. This added Assumptions 24 to 26, the `buffer_minutes` column, the seed service types and the "Operational delays" part of Data Flow.
 
+Caught by a second review session I ran (a separate AI session that read the doc cold), then checked before fixing:
+
+- The doc claimed a same-key race always ends in `23505` and a replay. A run on `postgres:18` showed it can end in `23P01` instead, depending on index creation order, so a retry could get 409 `no_technician` instead of its original booking. Fixed with an advisory lock on the key, and a test with one technician and one bay.
+- A fixed cap of 10 insert attempts could give up while a free pair was left, which would make the concurrency test flaky above 5 technicians. The cap was removed; the loop ends by itself.
+- Smaller ones: replay now runs before the time checks; `outside_hours` moved from 409 to 422; database guards for status values and dealership consistency; `X-Request-ID` is validated; load counts work minutes only; the 409 example had the wrong duration.
+
 Caught by the orchestrating AI, in subagent drafts:
 
 - The first ai-log described my asks wrongly and credited me with a check the AI ran. It was rewritten.
 - Data Model said a constraint "cannot express" vehicle ownership. That is false: a composite foreign key can. The real reason is that ownership changes over time.
 - The Postgres check table used made-up times. They were replaced by the times actually run.
-- Postgres's wait on an overlapping uncommitted insert was stated as fact with no test behind it. It is now marked as documented but not yet run, and a concurrency test was added to cover it.
+- Postgres's wait on an overlapping uncommitted insert was stated as fact with no test behind it. It was marked as not yet run, and later run on `postgres:18` during the race check above.
 - Technology Choices put untrue claims in my mouth ("uv daily", "less backend time in TypeScript"). They were removed.
 - A test expected `outside_hours` for a shift miss while Data Flow gives `no_technician`. The test was fixed.
 
@@ -624,7 +650,7 @@ The rule I followed: the AI proposes, I choose, a run or a test confirms.
 What I would do differently, and the limits:
 
 - An AI reviewing AI catches a lot, but not everything. My own read of this document is the last check, and it is still pending.
-- Some claims are still documented, not run, such as the Postgres wait behaviour. They stay marked that way until a test covers them.
+- A claim that sounds like standard database behaviour can still be wrong: the same-key race above was written as fact and was false. From now on, behaviour the design depends on is run on `postgres:18` before it goes in the doc.
 
 ## Out of Scope and Future Work
 
@@ -641,6 +667,7 @@ What I would do differently, and the limits:
 - Read replica for availability, managed Postgres with failover, and partitioning by dealership. See Scalability, Performance and Reliability.
 - An alerting stack. Only example rules are written (see Appendix A).
 - Distributed tracing with OpenTelemetry (see Traces in Observability).
+- Idempotency key expiry and per-client key scopes. Keys are stored forever and are global, which is acceptable without auth (Assumption 23).
 
 Working hours and the availability query are steps 3 and 4 of the build order. If either is not built by the deadline, this document will mark it "designed, not built".
 
@@ -660,7 +687,7 @@ Example alerts. These are written as rules a Prometheus setup would run. No aler
 
 | Alert | Condition (example) | Why |
 |---|---|---|
-| Rejection rate by reason | `booking_rejected_total{reason="no_technician"}` above 30% of booking requests over 30 minutes | Dealership is short of qualified staff, or seed data or shifts are wrong. Split by reason tells the two apart from `outside_hours` client errors. |
+| Rejection rate by reason | `booking_rejected_total{reason="no_technician"}` above 30% of booking requests over 30 minutes | Dealership is short of qualified staff, or seed data or shifts are wrong. Split by reason tells a staff shortage apart from a bay shortage. |
 | Slow bookings | p95 of `http_request_duration_seconds{route="/appointments",method="POST"}` above 500 ms for 10 minutes | Database slow, pool exhausted, or long lock waits. |
 | Contention | share of bookings with `booking_insert_attempts` above 1 grows above 5% | Many requests race for the same slots. A sign to look at hot dealerships before users see more 409s. |
 | Not ready | `/ready` failing on any instance for 2 minutes | Database unreachable from that instance. |
