@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app import errors
+from app import errors, observability
 from app.db import make_engine
 from app.routers import appointments, health
 from app.settings import Settings
@@ -22,7 +22,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await app.state.engine.dispose()
 
 
+observability.configure()
+
 app = FastAPI(title="Unified Service Scheduler", lifespan=lifespan)
+app.add_middleware(observability.RequestMiddleware)
 app.include_router(health.router)
 app.include_router(appointments.router)
 errors.register(app)

@@ -6,9 +6,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
+import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import repository
+from app.observability import BOOKED, CANCELLED, REJECTED
 from app.repository import AppointmentRecord, Overlap
 from app.services.rules import (
     FieldError,
@@ -63,12 +65,27 @@ class AppointmentNotFound(Exception):
     pass
 
 
+log = structlog.get_logger()
+
+
 def _vehicle_busy(appointment_id: int) -> BookingConflict:
     return BookingConflict(
         "vehicle_busy",
         f"The vehicle already has appointment {appointment_id} at this time.",
         appointment_id,
     )
+
+
+def _rejected(conflict: BookingConflict, attempts: int) -> BookingConflict:
+    """Count and log a 409 before it is raised."""
+    REJECTED.labels(conflict.reason).inc()
+    log.info(
+        "booking_rejected",
+        reason=conflict.reason,
+        appointment_id=conflict.appointment_id,
+        attempts=attempts,
+    )
+    return conflict
 
 
 async def book(session: AsyncSession, req: BookingRequest, *, now: datetime) -> AppointmentRecord:
@@ -98,6 +115,7 @@ async def book(session: AsyncSession, req: BookingRequest, *, now: datetime) -> 
         tz = ZoneInfo(dealership.timezone)
         windows = await repository.opening_windows(session, dealership.id)
         if not check_opening_hours(start, end, tz, windows):
+            log.info("booking_invalid", reason="outside_hours")
             raise BookingValidationError(
                 [FieldError("start", "the work must fit inside the dealership's opening hours")],
                 reason="outside_hours",
@@ -108,7 +126,7 @@ async def book(session: AsyncSession, req: BookingRequest, *, now: datetime) -> 
 
         clash = await repository.find_vehicle_clash(session, req.vehicle_id, start, reserved_until)
         if clash is not None:
-            raise _vehicle_busy(clash)
+            raise _rejected(_vehicle_busy(clash), attempts=0)
 
         day_from, day_to = local_day_bounds(start, tz)
         techs = await repository.candidate_techs(
@@ -130,7 +148,10 @@ async def book(session: AsyncSession, req: BookingRequest, *, now: datetime) -> 
 
         # Each failed attempt drops one technician or one bay, so the loop ends after at
         # most len(techs) + len(bays) attempts; no fixed cap (design.md Data Flow).
+        record: AppointmentRecord | None = None
+        attempts = 0
         while techs and bays:
+            attempts += 1
             outcome = await repository.insert_appointment(
                 session,
                 customer_id=req.customer_id,
@@ -146,7 +167,7 @@ async def book(session: AsyncSession, req: BookingRequest, *, now: datetime) -> 
             if not isinstance(outcome, Overlap):
                 record = await repository.get_appointment(session, outcome)
                 assert record is not None
-                return record
+                break
             if outcome.constraint == "no_tech_overlap":
                 techs.pop(0)
             elif outcome.constraint == "no_bay_overlap":
@@ -154,26 +175,34 @@ async def book(session: AsyncSession, req: BookingRequest, *, now: datetime) -> 
             else:  # no_vehicle_overlap: another pair cannot help
                 break
 
-        # A resent request may lose on any index; read the vehicle again so the reason
-        # does not depend on index order.
-        clash = await repository.find_vehicle_clash(session, req.vehicle_id, start, reserved_until)
-        reason = pick_reason(vehicle_busy=clash is not None, techs_empty=not techs)
-        if clash is not None:  # reason == "vehicle_busy"
-            raise _vehicle_busy(clash)
-        start_utc, until_utc = start.astimezone(UTC), reserved_until.astimezone(UTC)
-        window = f"{start_utc:%H:%M} to {until_utc:%H:%M} UTC on {start_utc:%Y-%m-%d}"
-        work = (
-            f"{service_type.name}: {service_type.duration_minutes} min work"
-            f" + {service_type.buffer_minutes} min buffer"
-        )
-        if reason == "no_technician":
-            detail = (
-                f"No technician with skill {service_type.required_skill_code}"
-                f" is free from {window} ({work})."
+        if record is None:
+            # A resent request may lose on any index; read the vehicle again so the reason
+            # does not depend on index order.
+            clash = await repository.find_vehicle_clash(
+                session, req.vehicle_id, start, reserved_until
             )
-        else:
-            detail = f"No compatible bay is free from {window} ({work})."
-        raise BookingConflict(reason, detail)
+            reason = pick_reason(vehicle_busy=clash is not None, techs_empty=not techs)
+            if clash is not None:  # reason == "vehicle_busy"
+                raise _rejected(_vehicle_busy(clash), attempts)
+            start_utc, until_utc = start.astimezone(UTC), reserved_until.astimezone(UTC)
+            window = f"{start_utc:%H:%M} to {until_utc:%H:%M} UTC on {start_utc:%Y-%m-%d}"
+            work = (
+                f"{service_type.name}: {service_type.duration_minutes} min work"
+                f" + {service_type.buffer_minutes} min buffer"
+            )
+            if reason == "no_technician":
+                detail = (
+                    f"No technician with skill {service_type.required_skill_code}"
+                    f" is free from {window} ({work})."
+                )
+            else:
+                detail = f"No compatible bay is free from {window} ({work})."
+            raise _rejected(BookingConflict(reason, detail), attempts)
+
+    # counted after the commit, so a failed commit is not counted as booked
+    BOOKED.labels(str(record.dealership_id)).inc()
+    log.info("appointment_booked", appointment_id=record.id, attempts=attempts)
+    return record
 
 
 async def get(session: AsyncSession, appointment_id: int) -> AppointmentRecord:
@@ -186,8 +215,11 @@ async def get(session: AsyncSession, appointment_id: int) -> AppointmentRecord:
 
 async def cancel(session: AsyncSession, appointment_id: int) -> AppointmentRecord:
     async with session.begin():
-        await repository.cancel_appointment(session, appointment_id)
+        changed = await repository.cancel_appointment(session, appointment_id)
         record = await repository.get_appointment(session, appointment_id)
     if record is None:
         raise AppointmentNotFound(appointment_id)
+    if changed:
+        CANCELLED.inc()
+        log.info("appointment_cancelled", appointment_id=appointment_id)
     return record

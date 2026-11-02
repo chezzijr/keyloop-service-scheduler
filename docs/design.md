@@ -300,7 +300,7 @@ The log fields are listed in [details/observability.md](details/observability.md
 
 Request bodies are not logged, so customer names and emails stay out of the logs.
 
-Metrics. Served at `GET /metrics` in Prometheus text format: request latency per route, bookings made, bookings rejected by reason, insert attempts per booking (contention), and cancels. The full table is in [details/observability.md](details/observability.md#metrics).
+Metrics. Served at `GET /metrics` in Prometheus text format: request latency per route, bookings made, bookings rejected by reason, and cancels. The full table is in [details/observability.md](details/observability.md#metrics).
 
 Labels only take values from a small, fixed set. Ids go in logs, never in labels ([why](details/observability.md#label-cardinality)).
 
@@ -311,7 +311,7 @@ Health checks.
 - `GET /health` is liveness. It returns 200 if the process can answer. It does not touch the database, so a database outage does not make the orchestrator restart healthy API containers.
 - `GET /ready` is readiness. It runs `SELECT 1` on the pool. It returns 503 if that fails, so a load balancer stops sending traffic to that instance.
 
-Example alerts. Four example Prometheus alert rules (rejection rate by reason, slow bookings, contention, instance not ready) are in [details/observability.md](details/observability.md#example-alerts). No alerting stack is part of this build.
+Example alerts. Three example Prometheus alert rules (rejection rate by reason, slow bookings, instance not ready) are in [details/observability.md](details/observability.md#example-alerts). No alerting stack is part of this build.
 
 ## Scalability, Performance and Reliability
 

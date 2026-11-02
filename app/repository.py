@@ -253,12 +253,13 @@ async def get_appointment(session: AsyncSession, appointment_id: int) -> Appoint
     return AppointmentRecord(*row) if row else None
 
 
-async def cancel_appointment(session: AsyncSession, appointment_id: int) -> None:
-    """Set cancelled once; a second call changes nothing (A20)."""
-    await session.execute(
+async def cancel_appointment(session: AsyncSession, appointment_id: int) -> bool:
+    """Set cancelled once; a second call changes nothing (A20). True if a row changed."""
+    result = await session.execute(
         text(
             "UPDATE appointment SET status = 'cancelled', cancelled_at = now()"
             " WHERE id = :id AND status = 'confirmed'"
         ),
         {"id": appointment_id},
     )
+    return result.rowcount > 0

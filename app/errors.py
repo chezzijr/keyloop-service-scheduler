@@ -26,6 +26,7 @@ def problem(
         "detail": detail,
         "instance": request.url.path,
     }
+    extra["request_id"] = getattr(request.state, "request_id", None)  # set by the middleware
     content.update({k: v for k, v in extra.items() if v is not None})
     return JSONResponse(content, status_code=status, media_type="application/problem+json")
 

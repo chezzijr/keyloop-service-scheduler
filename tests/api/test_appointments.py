@@ -124,6 +124,7 @@ async def test_no_technician_is_409_with_detail(seeded: AsyncClient) -> None:
         " (EV battery health check: 60 min work + 15 min buffer).",
         "instance": "/appointments",
         "reason": "no_technician",
+        "request_id": response.headers["x-request-id"],
     }
 
 
