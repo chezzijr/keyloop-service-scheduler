@@ -32,34 +32,15 @@ Scope:
 
 ## Assumptions
 
-Each line is a decision taken where the brief is silent.
+The brief leaves many rules open. There are 26 numbered assumptions; the full list is in [details/assumptions.md](details/assumptions.md). "Assumption N" in this document refers to that list. The ones that shape the design most:
 
-1. Reference data (dealerships, bays, technicians, skills, service types, customers, vehicles) lives in other Keyloop systems. Here it is seeded by a script; there are no CRUD endpoints for it.
-2. The client does not choose the bay or technician. The system assigns both.
-3. Technician choice: among qualified technicians on shift, pick the least-loaded one. Ties go to the lowest technician id.
-4. Load = sum of booked work minutes (`duration_minutes`, not the buffer) of active appointments for that technician on that local day. It is read without a lock, so it affects fairness only, never correctness.
-5. Bay choice: the compatible bay with the lowest id that is free.
-6. If the insert fails because a bay or technician was taken in the meantime (SQLSTATE `23P01`), the service tries the next candidate pair.
-7. All timestamps are stored as `timestamptz` in UTC. Each dealership has an IANA time zone (for example `Europe/London`) used for opening hours, shifts and "local day".
-8. Start times sit on a 15-minute grid (minute 0, 15, 30 or 45, zero seconds) in UTC.
-9. Duration comes from the service type. The client does not send an end time. End = start + duration. This is a planned end, not a measured one (Assumption 24).
-10. Each service type requires one bay type (for example `lift`, `alignment`) and one technician skill (for example `ev_hv`). A bay is compatible if its type matches. A technician is qualified if they have the skill.
-11. One appointment covers exactly one service type.
-12. Dealership opening hours and technician shifts are a weekly pattern: weekday (ISO, 1 = Monday) with a local start and end time, one window per weekday (no split shifts). So lunch breaks are not modelled: a technician counts as available for the whole shift. The 15-minute buffer (Assumption 24) is slack for overruns, not a break, because an overrun uses it up. There are no holidays, closures or one-off exceptions.
-13. The work part `[start, end)` must fall inside the dealership's opening hours and inside the assigned technician's shift for that weekday. The buffer (Assumption 24) may run past closing time. An appointment does not cross midnight local time.
-14. Booking window: the start must not be in the past and must be at most 90 days ahead.
-15. Time ranges are half-open. The overlap rules use the reserved range `[start, reserved_until)` (work + buffer, Assumption 24). A reserved range ending at 10:00 does not conflict with one starting at 10:00.
-16. The vehicle must belong to the customer in the request.
-17. A booking that conflicts with other bookings returns 409 with a `reason`: `no_bay`, `no_technician` or `idempotency_key_reused`. A start outside opening hours returns 422 with `reason: outside_hours`, because it depends on configuration, not on other bookings, so retrying can never succeed.
-18. Idempotency: `POST /appointments` requires an `Idempotency-Key` header. The key is stored in a UNIQUE `idempotency_key` column with a `request_hash` (SHA-256 of the canonical JSON body).
-19. Same key and same body returns 200 with the original appointment. Same key and a different body returns 409 `idempotency_key_reused`.
-20. Cancel sets `status = cancelled` and `cancelled_at`; the row is kept. Cancelled rows no longer block the bay or technician. Cancelling an already cancelled appointment returns 200 with the same record.
-21. Errors use RFC 9457 `application/problem+json`.
-22. Request validation errors return 422. This covers an off-grid start, a start in the past, a start more than 90 days ahead, work outside opening hours (`reason: outside_hours`), a vehicle not owned by the customer, unknown reference ids and a missing `Idempotency-Key`. A request whose key was already used gets its replay before these checks run (see Data Flow).
-23. There is no authentication or authorisation in this service. An API gateway in front of it is assumed to handle that.
-24. Nobody knows in advance how long a real repair takes. Workshops book against a planned duration: a standard labour time per job. So `duration_minutes` is planned time, and each service type also has `buffer_minutes` (default 15, a multiple of 15) as slack for small overruns. The bay and technician are reserved for `[start, start + duration + buffer)`. This range is what `during` stores and what the overlap rules check. The API returns both `end` (planned end of work) and `reserved_until` (end of the buffer).
-25. The system stores the plan only. If a job overruns past its buffer, nothing moves automatically. The service advisor (the person who manages bookings at the front desk) tells the next customer, or cancels and rebooks. See "Operational delays" in Data Flow.
-26. Jobs that can last several days are out of scope. That covers repairs that start with fault diagnosis, jobs waiting for parts, and body repair. Every appointment here is one known service type with a planned duration inside one working day.
+- The system picks the bay and technician; the client does not (2, 3, 5).
+- Duration is a planned standard labour time plus a 15-minute buffer. Overruns are handled by the service advisor, not by the system (9, 24, 25).
+- Start times sit on a 15-minute UTC grid, at most 90 days ahead (8, 14).
+- Opening hours and shifts are one weekly window per day; lunch breaks are not modelled (12, 13).
+- A conflict with other bookings returns 409; bad input, including a start outside opening hours, returns 422 (17, 22).
+- `POST /appointments` requires an `Idempotency-Key` (18, 19).
+- No authentication in this service; an API gateway handles it (23).
 
 ## Architecture
 
@@ -131,95 +112,9 @@ erDiagram
     CUSTOMER ||--o{ VEHICLE : owns
     CUSTOMER ||--o{ APPOINTMENT : books
     VEHICLE ||--o{ APPOINTMENT : "serviced in"
-
-    DEALERSHIP {
-        bigint id PK
-        text name
-        text timezone "IANA, e.g. Europe/London"
-    }
-    BAY_TYPE {
-        bigint id PK
-        text code UK "e.g. lift, alignment"
-    }
-    SERVICE_BAY {
-        bigint id PK
-        bigint dealership_id FK
-        bigint bay_type_id FK
-        text name
-    }
-    SKILL {
-        bigint id PK
-        text code UK "e.g. ev_hv"
-    }
-    TECHNICIAN {
-        bigint id PK
-        bigint dealership_id FK
-        text name
-    }
-    TECHNICIAN_SKILL {
-        bigint technician_id PK, FK
-        bigint skill_id PK, FK
-    }
-    SERVICE_TYPE {
-        bigint id PK
-        text code UK
-        text name
-        int duration_minutes "planned, multiple of 15"
-        int buffer_minutes "default 15, multiple of 15"
-        bigint required_skill_id FK
-        bigint required_bay_type_id FK
-    }
-    CUSTOMER {
-        bigint id PK
-        text name
-        text email
-    }
-    VEHICLE {
-        bigint id PK
-        bigint customer_id FK
-        text vin UK
-        text make
-        text model
-    }
-    OPENING_HOURS {
-        bigint dealership_id PK, FK
-        smallint weekday PK "ISO 1-7"
-        time opens_at "local"
-        time closes_at "local"
-    }
-    TECHNICIAN_SHIFT {
-        bigint technician_id PK, FK
-        smallint weekday PK "ISO 1-7"
-        time starts_at "local"
-        time ends_at "local"
-    }
-    APPOINTMENT {
-        bigint id PK
-        bigint customer_id FK
-        bigint vehicle_id FK
-        bigint dealership_id FK
-        bigint service_type_id FK
-        bigint service_bay_id FK
-        bigint technician_id FK
-        tstzrange during "half-open, start to end + buffer"
-        text status "confirmed or cancelled"
-        text idempotency_key UK
-        text request_hash "SHA-256 of body"
-        timestamptz created_at
-        timestamptz cancelled_at "null unless cancelled"
-    }
 ```
 
-Seed service types. Durations are illustrative, in the style of standard labour times, not real figures from a manufacturer. The set covers one shared bay type (`lift`), two special bays (`alignment`, `mot_lane`) for the `no_bay` case, and rare skills for the `no_technician` case.
-
-| Service type | Duration | Buffer | Bay type | Skill |
-|---|---|---|---|---|
-| Oil and filter change | 45 min | 15 min | `lift` | `general` |
-| Full annual service | 180 min | 15 min | `lift` | `general` |
-| Brake pads replacement | 90 min | 15 min | `lift` | `general` |
-| Wheel alignment | 60 min | 15 min | `alignment` | `alignment` |
-| MOT test (UK yearly road-safety test) | 60 min | 15 min | `mot_lane` | `mot_tester` |
-| EV battery health check | 60 min | 15 min | `lift` | `ev_hv` |
+Columns, the seed service types and the other database guards (a status `CHECK` and dealership foreign keys) are in [details/data-model.md](details/data-model.md).
 
 The rule against double-booking lives in the database, not in application code:
 
@@ -235,23 +130,7 @@ ALTER TABLE appointment
   ADD CONSTRAINT no_tech_overlap
   EXCLUDE USING gist (technician_id WITH =, during WITH &&)
   WHERE (status <> 'cancelled');
-
--- the overlap rules depend on status, so a typo like 'canceled' must be impossible
-ALTER TABLE appointment
-  ADD CONSTRAINT status_valid CHECK (status IN ('confirmed', 'cancelled'));
-
--- the bay and technician must belong to the appointment's dealership
--- (service_bay and technician each get UNIQUE (id, dealership_id) for this)
-ALTER TABLE appointment
-  ADD CONSTRAINT bay_in_dealership
-  FOREIGN KEY (service_bay_id, dealership_id) REFERENCES service_bay (id, dealership_id);
-
-ALTER TABLE appointment
-  ADD CONSTRAINT tech_in_dealership
-  FOREIGN KEY (technician_id, dealership_id) REFERENCES technician (id, dealership_id);
 ```
-
-An insert that overlaps an active appointment on the same bay or technician fails with SQLSTATE `23P01`, and the error names the constraint, so the service knows which resource clashed. The booking service checks that the vehicle belongs to the customer before the insert. A composite foreign key `(vehicle_id, customer_id)` could enforce this in the database. It is not used because a vehicle can change owner later, and a past appointment must keep the customer who booked it.
 
 ## API
 
@@ -267,78 +146,7 @@ The OpenAPI UI served at `/docs` is the mocked client. It lists every endpoint w
 | GET | `/ready` | Readiness: the database answers | 200 (503 if not) |
 | GET | `/metrics` | Prometheus metrics | 200 |
 
-`GET /availability` query parameters:
-
-- `dealership_id`: the dealership.
-- `service_type_id`: decides duration, bay type and skill.
-- `date`: a local date in the dealership's time zone, for example `2026-11-10`.
-
-The response lists the 15-minute start times on that date where at least one qualified technician and one compatible bay are free for the whole duration. It is advisory. The booking insert is the final check.
-
-Booking request:
-
-```http
-POST /appointments
-Content-Type: application/json
-Idempotency-Key: 6f1c2a0e-8b7d-4c1e-9a55-2d3f4e5a6b7c
-
-{
-  "customer_id": 42,
-  "vehicle_id": 314,
-  "dealership_id": 1,
-  "service_type_id": 3,
-  "start": "2026-11-10T09:00:00Z"
-}
-```
-
-Response `201 Created`:
-
-```json
-{
-  "id": 1001,
-  "customer_id": 42,
-  "vehicle_id": 314,
-  "dealership_id": 1,
-  "service_type_id": 3,
-  "bay": { "id": 7, "name": "Bay 2" },
-  "technician": { "id": 12, "name": "Minh Tran" },
-  "start": "2026-11-10T09:00:00Z",
-  "end": "2026-11-10T10:30:00Z",
-  "reserved_until": "2026-11-10T10:45:00Z",
-  "status": "confirmed",
-  "created_at": "2026-11-01T08:15:02Z"
-}
-```
-
-Sending the same request again with the same `Idempotency-Key` returns `200 OK` with this same body. No second appointment is created.
-
-Response `409 Conflict` when no qualified technician is free:
-
-```http
-HTTP/1.1 409 Conflict
-Content-Type: application/problem+json
-
-{
-  "type": "https://example.com/problems/booking-conflict",
-  "title": "Appointment cannot be booked",
-  "status": 409,
-  "detail": "No technician with skill ev_hv is free from 09:00 to 10:15 UTC on 2026-11-10 (EV battery health check: 60 min work + 15 min buffer).",
-  "instance": "/appointments",
-  "reason": "no_technician",
-  "request_id": "b7e4c1d2a9f0"
-}
-```
-
-Status codes:
-
-- `201 Created`: appointment booked.
-- `200 OK`: idempotent replay of a booking, a read, a cancel, or an availability result.
-- `404 Not Found`: appointment id does not exist.
-- `409 Conflict`: the request is valid but conflicts with other bookings. `reason` is one of `no_bay`, `no_technician`, `idempotency_key_reused`.
-- `422 Unprocessable Content`: validation failed. Examples: start not on the 15-minute grid, start in the past, start more than 90 days ahead, work outside opening hours (`reason: outside_hours`), vehicle not owned by the customer, unknown reference id, missing `Idempotency-Key`. The problem body lists the failing fields in `errors`.
-- `503 Service Unavailable`: `/ready` when the database cannot be reached, or any request whose query hits the database `statement_timeout` (see Scalability, Performance and Reliability).
-
-All error bodies use RFC 9457 `application/problem+json` with `type`, `title`, `status`, `detail`, `instance`, plus `reason` for 409 and for 422 `outside_hours`, and `request_id` for tracing.
+Errors use RFC 9457 `application/problem+json`. A conflict with other bookings returns 409 with a `reason` (`no_bay`, `no_technician`, `idempotency_key_reused`); bad input returns 422. Query parameters, request and response examples and the full status code list are in [details/api.md](details/api.md).
 
 ## Data Flow
 
@@ -456,21 +264,7 @@ The last case matters most. It shows that the technician check is independent of
 
 `GET /availability` answers: "at which start times on this local date can this service type be booked at this dealership?"
 
-Input: `dealership_id`, `service_type_id`, `date` (local date in the dealership's time zone).
-
-Steps:
-
-1. Load the service type: duration, required bay type, required skill.
-2. Find the opening window for the date's ISO weekday. No row for that weekday means the dealership is closed and the result is an empty list.
-3. Convert the local window to UTC with the dealership's IANA time zone using Python `zoneinfo`. The conversion is done for that exact date, so a DST change (for example the last Sunday of October in `Europe/London`) gives the right UTC times. Local midnight to the next local midnight gives the UTC range of the day.
-4. Generate candidate starts on the 15-minute UTC grid (Assumption 8) where `start >= opens_at` and `start + duration <= closes_at` (the buffer may run past closing, Assumption 13). Drop starts in the past or more than 90 days ahead (Assumption 14).
-5. In one query, load the active appointments that overlap the day for the dealership's compatible bays and qualified technicians. In the same round trip, load the shifts of those technicians for that weekday.
-6. In memory, a start `s` is free if both hold:
-   - some qualified technician has a shift that covers `[s, s + duration)` and no active appointment that overlaps `[s, s + duration + buffer)`, and
-   - some compatible bay has no active appointment that overlaps `[s, s + duration + buffer)`.
-7. Return the free starts in time order.
-
-Cost. One or two queries per request, then `O(slots x (techs + bays))` checks in memory, where each check scans that resource's appointments for the day. A 10-hour day has 40 slots. With 20 resources and a handful of appointments each, that is a few thousand comparisons. This is small enough that no cache is needed.
+It turns the opening window for that date into 15-minute starts (DST-safe through `zoneinfo`), loads the day's appointments and shifts in one or two queries, and keeps the starts where some qualified technician and some compatible bay are free for work + buffer. The steps and the cost estimate are in [details/availability.md](details/availability.md).
 
 The result is advisory. Another request can take a slot between the availability call and the booking. The booking insert and its exclusion constraints make the final decision, and the client gets a 409 with a `reason` if the slot is gone.
 
@@ -501,33 +295,22 @@ Request id. The middleware reads the `X-Request-ID` header. It accepts the value
 
 Logs. structlog writes one JSON object per line to stdout. The container platform collects stdout, so the app does not manage log files. Each request ends with one access line. Booking adds one line with its outcome.
 
-| Field | Meaning |
-|---|---|
-| `ts` | UTC timestamp, ISO 8601 |
-| `level` | `info`, `warning` or `error` |
-| `request_id` | from `X-Request-ID` or generated |
-| `method` | HTTP method |
-| `route` | route template, for example `/appointments/{id}`, not the raw path |
-| `status` | HTTP status code |
-| `latency_ms` | time spent in the app for this request |
-| `appointment_id` | set when a booking or cancel touches an appointment |
-| `reason` | set on a 409 (`no_bay`, `no_technician`, `idempotency_key_reused`) or a 422 `outside_hours` |
-| `attempts` | number of insert attempts in the booking loop (1 to \|T\| + \|B\|) |
+The log fields are listed in [details/observability.md](details/observability.md#log-fields).
 
 Request bodies are not logged, so customer names and emails stay out of the logs.
 
-Metrics. Served at `GET /metrics` in Prometheus text format: request latency per route, bookings made, bookings rejected by reason, insert attempts per booking (contention), and cancels. The full table is in Appendix A.
+Metrics. Served at `GET /metrics` in Prometheus text format: request latency per route, bookings made, bookings rejected by reason, insert attempts per booking (contention), and cancels. The full table is in [details/observability.md](details/observability.md#metrics).
 
-Label cardinality. Labels only take values from a small, fixed set: route templates, methods, status codes, reasons and dealership ids. Customer ids, vehicle ids, appointment ids, idempotency keys and request ids are never labels. Each new label value creates a new time series in Prometheus, so an unbounded id would grow memory without limit. Those ids belong in logs.
+Labels only take values from a small, fixed set. Ids go in logs, never in labels ([why](details/observability.md#label-cardinality)).
 
-Traces (designed, not built). OpenTelemetry would instrument FastAPI (one span per request) and SQLAlchemy (one child span per query), so a slow booking would show whether the time went to the candidate queries, the insert loop or a wait on another transaction. Spans would go over OTLP to a viewer such as Jaeger, switched on by `OTEL_EXPORTER_OTLP_ENDPOINT`. It is not built because this system has one service and one database: the `request_id` in logs, `latency_ms` and the latency histogram already find a slow request. Tracing pays off once a request crosses several services.
+Traces (designed, not built). OpenTelemetry would add one span per request and per query. It is not built, because one service with `request_id` logs and latency metrics already finds a slow request ([details](details/observability.md#traces-designed-not-built)).
 
 Health checks.
 
 - `GET /health` is liveness. It returns 200 if the process can answer. It does not touch the database, so a database outage does not make the orchestrator restart healthy API containers.
 - `GET /ready` is readiness. It runs `SELECT 1` on the pool. It returns 503 if that fails, so a load balancer stops sending traffic to that instance.
 
-Example alerts. Four example Prometheus alert rules (rejection rate by reason, slow bookings, contention, instance not ready) are in Appendix A. No alerting stack is part of this build.
+Example alerts. Four example Prometheus alert rules (rejection rate by reason, slow bookings, contention, instance not ready) are in [details/observability.md](details/observability.md#example-alerts). No alerting stack is part of this build.
 
 ## Scalability, Performance and Reliability
 
@@ -563,40 +346,12 @@ Future, not built:
 
 The core rule lives in Postgres, so most tests that matter run against a real Postgres. Pure rules that need no database are unit tested.
 
-Unit tests (no database, fast):
+The test groups, with the full case list in [details/testing.md](details/testing.md):
 
-- End time: `end` = start + `duration_minutes`, `reserved_until` = `end` + `buffer_minutes`, and the half-open range `[start, reserved_until)`.
-- Buffer near closing: a job whose work ends exactly at closing time is accepted even though its buffer runs past it.
-- Request validation: a start off the 15-minute grid, with seconds, in the past, or more than 90 days ahead is rejected with 422. The clock is injected, so tests do not depend on today's date.
-- Slot generation for one local date: the first and last start inside opening hours, a service longer than the window gives no slots, and a closed weekday gives an empty list.
-- DST: slot generation in `Europe/London` on 2026-10-25 (a Sunday), the day clocks go back. The test passes its own Sunday opening window to the slot function, so it does not depend on seed data. Opening at 08:00 local is 07:00 UTC on 2026-10-24 and 08:00 UTC on 2026-10-25. The test checks the UTC starts of both days. The clock is fixed to a date before them, so the past-start rule does not drop the slots.
-- Reason precedence: empty tech list gives `no_technician` even when bays are also empty. Empty bay list only gives `no_bay`. 
-
-Integration tests on real Postgres (testcontainers starts `postgres:18`; Alembic builds the schema; each test runs in a clean state):
-
-- Bay overlap: a second booking that overlaps in the same bay with a different technician fails with `no_bay_overlap`.
-- Technician overlap: a second booking for the same technician in a different bay fails with `no_tech_overlap`.
-- Touching reserved ranges: a 60-min job at 10:00 (reserved until 11:15, work + buffer) and a booking at 11:15 for the same bay and technician both succeed.
-- Buffer blocks: after a 90-min job at 09:00 (reserved until 10:45), a booking for the same technician at 10:30 is refused and one at 10:45 succeeds.
-- Cancel frees the slot: book, cancel, then book the same slot again and get 201. Cancelling twice returns 200 with the same record.
-- Idempotent replay: the same key and body returns 200 with the same appointment id, and the table still has one row. The same key with a different body returns 409 `idempotency_key_reused`.
-- Least-loaded pick: with two qualified technicians and one already booked for 2 hours that day, the booking goes to the other one. With equal load, it goes to the lower id.
-- `outside_hours`: a booking that starts before opening or whose work ends after closing returns 422 with `reason: outside_hours`.
-- Late retry: a booking replayed with the same key after its start time has passed returns 200 with the original, not 422.
-- Database guards: inserting a status other than `confirmed` or `cancelled` fails on `status_valid`; a bay from another dealership fails on `bay_in_dealership`, and a technician from another dealership fails on `tech_in_dealership`.
-- Shifts: a booking inside opening hours but outside every qualified technician's shift returns 409 `no_technician`.
-- Vehicle ownership: a vehicle that belongs to another customer returns 422.
-
-Concurrency tests (real Postgres, real parallel connections):
-
-- One slot, capacity k. Seed k qualified technicians and k compatible bays. Send N > k bookings for the same start at the same time with `asyncio.gather`, each with its own key and its own connection. Expect exactly k responses of 201 and N - k of 409. This holds for any k, because the loop has no fixed attempt cap (see Data Flow). Then query the table and check that no two active rows share a bay or a technician with overlapping `during`.
-- Same key twice at once. Seed exactly one qualified technician and one compatible bay, so a lost race has no other candidate to fall back to. Send two identical requests with the same `Idempotency-Key` in parallel. Expect one 201 and one 200 with the same appointment id, and exactly one row. This is the case that returned 409 before the key lock was added (see Concurrency and Correctness).
-
-API tests (httpx `AsyncClient` against the app in process, on the same test database):
-
-- Status codes and `problem+json` bodies for 201, 200, 404, 409 and 422, including `reason` and `request_id`.
-- `X-Request-ID` is echoed back when sent and generated when missing.
-- `/health` returns 200, `/ready` returns 200 with the database up, and `/metrics` lists the metric names from Appendix A.
+- Unit tests, no database: end and reserved times, request validation with an injected clock, slot generation, a DST day, reason precedence.
+- Integration tests on real `postgres:18` (testcontainers): bay and technician overlap, touching ranges and the buffer, cancel, idempotent replay, least-loaded pick, `outside_hours`, shifts, vehicle ownership, database guards.
+- Concurrency tests with real parallel connections: N bookings for k free pairs give exactly k 201s; two same-key requests at once give one 201 and one 200.
+- API tests with httpx: status codes, `problem+json` bodies, `X-Request-ID`, health, readiness and metrics.
 
 Why not SQLite. SQLite has no range types and no exclusion constraints. Tests on SQLite would skip the one rule that prevents double-booking, so they would pass while the real system could fail.
 
@@ -665,31 +420,8 @@ What I would do differently, and the limits:
 - Jobs over several days, fault diagnosis, waiting for parts (Assumption 26).
 - Automatic push of later appointments when a job overruns, a reassign endpoint, and recording actual start and finish times (see "Operational delays" in Data Flow).
 - Read replica for availability, managed Postgres with failover, and partitioning by dealership. See Scalability, Performance and Reliability.
-- An alerting stack. Only example rules are written (see Appendix A).
-- Distributed tracing with OpenTelemetry (see Traces in Observability).
+- An alerting stack. Only example rules are written (see [details/observability.md](details/observability.md#example-alerts)).
+- Distributed tracing with OpenTelemetry (see Traces in [Observability](#observability)).
 - Idempotency key expiry and per-client key scopes. Keys are stored forever and are global, which is acceptable without auth (Assumption 23).
 
 Working hours and the availability query are steps 3 and 4 of the build order. If either is not built by the deadline, this document will mark it "designed, not built".
-
-## Appendix A: Observability Detail
-
-Metrics:
-
-| Metric | Type | Labels | What it shows |
-|---|---|---|---|
-| `http_request_duration_seconds` | histogram | `route`, `method`, `status` | request rate, error rate and latency per endpoint |
-| `appointments_booked_total` | counter | `dealership_id` | successful bookings (201 only, not replays) |
-| `booking_rejected_total` | counter | `reason` | 409 responses by reason |
-| `booking_insert_attempts` | histogram | none | insert attempts per booking; a value above 1 means a race was lost |
-| `appointments_cancelled_total` | counter | none | cancels that changed a row |
-
-Example alerts. These are written as rules a Prometheus setup would run. No alerting stack is part of this build.
-
-| Alert | Condition (example) | Why |
-|---|---|---|
-| Rejection rate by reason | `booking_rejected_total{reason="no_technician"}` above 30% of booking requests over 30 minutes | Dealership is short of qualified staff, or seed data or shifts are wrong. Split by reason tells a staff shortage apart from a bay shortage. |
-| Slow bookings | p95 of `http_request_duration_seconds{route="/appointments",method="POST"}` above 500 ms for 10 minutes | Database slow, pool exhausted, or long lock waits. |
-| Contention | share of bookings with `booking_insert_attempts` above 1 grows above 5% | Many requests race for the same slots. A sign to look at hot dealerships before users see more 409s. |
-| Not ready | `/ready` failing on any instance for 2 minutes | Database unreachable from that instance. |
-
-The thresholds are starting points, not tuned values. They would be set from real traffic.
