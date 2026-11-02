@@ -109,9 +109,20 @@ async def lock_dealership(session: AsyncSession, dealership_id: int) -> None:
 
     Without it two inserts can deadlock (40P01): Postgres writes each new row before it
     runs the exclusion checks, so request P can wait on Q's pending row through
-    no_tech_overlap while Q waits on P's through no_bay_overlap. The key is the dealership
-    id; this app takes no other advisory locks."""
-    await session.execute(text("SELECT pg_advisory_xact_lock(:id)"), {"id": dealership_id})
+    no_tech_overlap while Q waits on P's through no_bay_overlap.
+
+    Lock keys: a dealership locks its id (positive), a vehicle locks minus its id, so the
+    two never collide. Callers take the dealership lock first, then the vehicle lock, so
+    the locks themselves cannot form a wait cycle."""
+    await session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": dealership_id})
+
+
+async def lock_vehicle(session: AsyncSession, vehicle_id: int) -> None:
+    """Run bookings for one vehicle one at a time, until this transaction ends.
+
+    no_vehicle_overlap spans dealerships, which the dealership lock does not cover: the same
+    vehicle booked at two dealerships at once can deadlock on that one constraint (40P01)."""
+    await session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": -vehicle_id})
 
 
 async def find_vehicle_clash(

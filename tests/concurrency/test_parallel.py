@@ -12,8 +12,9 @@ from datetime import UTC, datetime
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
+from app import repository
 from app.db import make_engine
 from app.main import app
 from app.routers.appointments import get_now
@@ -129,3 +130,28 @@ async def test_same_request_twice_gives_one_booking_and_vehicle_busy(
         assert lost.json()["appointment_id"] == won.json()["id"], round_
         async with engine.connect() as conn:
             assert await conn.scalar(text("SELECT count(*) FROM appointment")) == 1, round_
+
+
+async def test_booking_waits_for_the_vehicle_lock(
+    engine: AsyncEngine, client: AsyncClient, migrated_url: str
+) -> None:
+    """The same vehicle booked at two dealerships at once must not deadlock on
+    no_vehicle_overlap (the dealership lock does not cover it), so every booking also
+    takes a lock on its vehicle. Here another transaction holds vehicle 1's lock, so a
+    booking for vehicle 1 waits until the statement timeout (503) instead of inserting."""
+    async with engine.begin() as conn:
+        await seed(conn)
+    short = make_engine(migrated_url, statement_timeout_ms=200)
+    original = app.state.engine
+    app.state.engine = short
+    app.dependency_overrides[get_now] = lambda: NOW
+    try:
+        async with AsyncSession(engine) as holder:
+            async with holder.begin():
+                await repository.lock_vehicle(holder, 1)
+                response = await client.post("/appointments", json=booking(OIL, vehicle_id=1))
+        assert response.status_code == 503, response.text
+    finally:
+        app.dependency_overrides.clear()
+        app.state.engine = original
+        await short.dispose()

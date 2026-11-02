@@ -6,7 +6,7 @@ Status: draft, 2026-11-01. Scenario A (backend implemented, client mocked).
 
 - One FastAPI service + one PostgreSQL 18 database; the client is mocked (OpenAPI UI, cURL, tests).
 - Double-booking is impossible: three Postgres `EXCLUDE` constraints reject any overlap for the same bay, technician or vehicle, even with many API servers.
-- Bookings for one dealership run one at a time, under a Postgres advisory lock. Without it, two parallel inserts can deadlock; the concurrency test found this.
+- Bookings for one dealership, and for one vehicle, run one at a time, under Postgres advisory locks. Without it, two parallel inserts can deadlock; the concurrency test found this.
 - The system picks the bay and technician: least-loaded qualified tech, lowest-id bay.
 - A booking reserves planned work time + a 15-min buffer; overruns are handled by the advisor.
 - A vehicle cannot be in two bookings at once, so a resent request gets 409, not a second booking. Cancel frees the slot.
@@ -182,7 +182,7 @@ sequenceDiagram
     alt outside opening hours or crosses local midnight
         S-->>C: 422 reason outside_hours
     end
-    S->>P: pg_advisory_xact_lock(dealership_id)
+    S->>P: pg_advisory_xact_lock(dealership_id), then the vehicle's lock
     S->>P: active appointment for this vehicle overlapping [start, reserved_until)?
     alt vehicle already booked
         S-->>C: 409 vehicle_busy (+ appointment_id)
@@ -246,7 +246,7 @@ Why a database constraint and not application locks or `SELECT ... FOR UPDATE`:
 - A bug in application code cannot double-book. The worst a bug can do is pick a bad candidate, and the insert then fails.
 - Under concurrency, Postgres makes a second insert that overlaps an uncommitted one wait. If the first commits, the second fails with `23P01`. If the first rolls back, the second succeeds. No extra code is needed for this. Checked on `postgres:18` (2026-11-02): an insert started while an overlapping insert was uncommitted waited for it, then failed with `23P01` when it committed. The concurrency tests in Testing Strategy check it again through the API.
 
-Deadlock between inserts, and the dealership lock. The constraints alone are not enough under parallel load. Postgres writes a new row first and then runs each exclusion check, waiting on any overlapping row that is not committed yet. So request P can wait on Q's pending row through `no_tech_overlap` while Q waits on P's pending row through `no_bay_overlap`. Postgres breaks the cycle by failing one of them with `40P01` (deadlock detected), and that client would get a 500. The capacity concurrency test (3 technicians, 3 bays, 10 parallel requests) found this on `postgres:18` (2026-11-02). The fix: after validation, each booking takes `pg_advisory_xact_lock(dealership_id)`, which Postgres releases at commit or rollback. Bookings for one dealership then run one at a time, so no wait cycle can form, and the load count becomes exact. The lock lives in Postgres, so it holds across API instances. It prevents deadlocks, not double-booking: that is still the constraints' job. The cost is no parallel bookings within one dealership; each booking holds the lock for one short transaction. If one dealership ever needs more, the next step is to lock the chosen technician row and then the bay row in a fixed order before each insert.
+Deadlock between inserts, and the dealership lock. The constraints alone are not enough under parallel load. Postgres writes a new row first and then runs each exclusion check, waiting on any overlapping row that is not committed yet. So request P can wait on Q's pending row through `no_tech_overlap` while Q waits on P's pending row through `no_bay_overlap`. Postgres breaks the cycle by failing one of them with `40P01` (deadlock detected), and that client would get a 500. The capacity concurrency test (3 technicians, 3 bays, 10 parallel requests) found this on `postgres:18` (2026-11-02). The fix: after validation, each booking takes `pg_advisory_xact_lock(dealership_id)`, which Postgres releases at commit or rollback. Bookings for one dealership then run one at a time, so no wait cycle can form, and the load count becomes exact. The lock lives in Postgres, so it holds across API instances. It prevents deadlocks, not double-booking: that is still the constraints' job. The dealership lock does not cover one case: `no_vehicle_overlap` spans dealerships, so the same vehicle booked at two dealerships at once can deadlock on that one constraint (a code review found this; a test run hit it once in 300 rounds). So each booking also takes a second advisory lock on its vehicle, after the dealership lock. The keys never collide (a dealership locks its id, a vehicle minus its id), and the fixed order means the two locks cannot form a wait cycle. The cost is no parallel bookings within one dealership; each booking holds the lock for one short transaction. If one dealership ever needs more, the next step is to lock the chosen technician row and then the bay row in a fixed order before each insert.
 
 Half-open ranges. `during` is built with `tstzrange(start, reserved_until, '[)')`. A reserved range ending at 10:00 and one starting at 10:00 do not overlap, so back-to-back bookings in the same bay are allowed once the buffer has passed (Assumptions 15 and 24).
 
