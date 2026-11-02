@@ -15,5 +15,6 @@ COPY app ./app
 COPY scripts ./scripts
 
 EXPOSE 8000
-# one worker per container; scale by running more containers
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+# one worker per container; scale by running more containers. The app writes its own
+# JSON access line, so uvicorn's text access log is off.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-access-log"]
