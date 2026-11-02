@@ -1,0 +1,16 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+      # uv installs the Python in .python-version (3.14).
+      # Docker is on the runner, so testcontainers can start postgres:18.
+      - run: uv sync --frozen
+      - run: uv run pytest -q

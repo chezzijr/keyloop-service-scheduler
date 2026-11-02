@@ -271,12 +271,13 @@ The last case matters most. It shows that the technician check is independent of
 
 ## Technology Choices
 
-Versions are the ones installed and imported on Python 3.14 on 2026-11-01.
+Versions match `uv.lock` (Python 3.14).
 
 | Technology | Why | Alternative considered |
 |---|---|---|
 | Python 3.14 | Python is my strongest language, so I can write and review the code fastest and catch AI mistakes in it. `zoneinfo` in the standard library handles IANA time zones and DST. | TypeScript with Node (NestJS). Also a strong language for me. Python won on its Postgres tooling (SQLAlchemy range and exclusion types) and on `zoneinfo` in the standard library. |
 | FastAPI 0.162 | Generates the OpenAPI spec and the `/docs` UI from the code, and that UI is the mocked client. Async request handling fits an API that mostly waits on the database. Dependency injection makes it easy to swap the database session in tests. | Django REST Framework. I know Django well, and `django.contrib.postgres` has range fields and `ExclusionConstraint`, so it would work. It was not chosen because its ORM is sync-first and the admin, auth and templates are not needed here. |
+| uvicorn 0.54 | The ASGI server that runs FastAPI. One worker per container, so the in-process Prometheus registry holds every request's metrics. Scale by running more containers. | gunicorn with uvicorn workers. Rejected: several worker processes each keep their own metrics registry, so `/metrics` would show only the worker that answered the scrape. |
 | Pydantic 2.14 | Request and response schemas with validation, used by FastAPI. It checks shape and types; the 15-minute grid and the 90-day window are checked in the service. | Hand-written checks in the routers. More code, and the body's shape and types would not show in the OpenAPI spec. |
 | SQLAlchemy 2.1 async + asyncpg 0.32 | SQLAlchemy has the PostgreSQL types needed here (`TSTZRANGE`, `ExcludeConstraint`) and nested transactions for the `SAVEPOINT` loop. asyncpg is the async driver it supports for Postgres and exposes the SQLSTATE and constraint name of an error. | Raw SQL with asyncpg only. Less abstraction, but more boilerplate for mapping rows. psycopg 3 also works on 3.14 and is a fine driver; asyncpg was chosen as the common pairing for async SQLAlchemy. |
 | Alembic 1.20 | Versioned migrations for SQLAlchemy models. The exclusion constraints and the extension go in a migration, so every environment and every test database gets the same schema. | `metadata.create_all()`. No history, and no clean way to change the schema later. |
