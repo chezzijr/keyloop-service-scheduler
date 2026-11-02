@@ -1,0 +1,26 @@
+[project]
+name = "service-scheduler"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "alembic==1.20.1",
+    "asyncpg==0.32.0",
+    "fastapi==0.162.0",
+    "prometheus-client==0.26.0",
+    "pydantic==2.14.2",
+    "sqlalchemy[asyncio]==2.1.6",
+    "structlog==26.1.0",
+    "uvicorn==0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx==0.28.1",
+    "pytest==9.1.1",
+    "testcontainers==4.15.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
