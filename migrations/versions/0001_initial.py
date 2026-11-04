@@ -127,18 +127,30 @@ ALTER TABLE appointment
   ADD CONSTRAINT ends_at_in_during
   CHECK (lower(during) < ends_at AND ends_at <= upper(during));
 
--- a vehicle cannot be in two bookings at once; this also stops a resent request.
+-- The three rules against double-booking. Read each one as:
+--   "reject a new row if an active row has the same vehicle / technician / bay
+--    (WITH =) and a time range that overlaps (WITH &&)"
+-- during = [start, end of the cleanup buffer): it includes the start and excludes the
+-- end, so a booking that ends at 11:15 and one that starts at 11:15 do not overlap.
+-- gist is the index type that answers "do these ranges overlap?" quickly (btree_gist
+-- lets it compare plain ids too). Cancelled rows are ignored, so a cancel frees the slot
+-- at once. Postgres runs these checks on every insert, also against rows that other
+-- transactions have not committed yet, so two API servers can never both win a slot.
+
+-- a vehicle cannot be in two bookings at once. This also stops a resent request.
 -- Created first, so Postgres checks it first.
 ALTER TABLE appointment
   ADD CONSTRAINT no_vehicle_overlap
   EXCLUDE USING gist (vehicle_id WITH =, during WITH &&)
   WHERE (status <> 'cancelled');
 
+-- a technician cannot work on two bookings at once
 ALTER TABLE appointment
   ADD CONSTRAINT no_tech_overlap
   EXCLUDE USING gist (technician_id WITH =, during WITH &&)
   WHERE (status <> 'cancelled');
 
+-- a bay cannot hold two bookings at once
 ALTER TABLE appointment
   ADD CONSTRAINT no_bay_overlap
   EXCLUDE USING gist (service_bay_id WITH =, during WITH &&)

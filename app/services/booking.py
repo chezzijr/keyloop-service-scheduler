@@ -89,7 +89,22 @@ def _rejected(conflict: BookingConflict, attempts: int) -> BookingConflict:
 
 
 async def book(session: AsyncSession, req: BookingRequest, *, now: datetime) -> AppointmentRecord:
+    """Book one appointment. Everything runs in one database transaction.
+
+    Step 1  check the request: ids exist and belong together, start time, opening hours
+    Step 2  lock: one booking at a time per dealership, and per vehicle
+    Step 3  does this vehicle already have a booking at that time?  -> 409 vehicle_busy
+    Step 4  list free qualified technicians (least work that day first) and free bays
+    Step 5  insert the first (technician, bay) pair; on a clash, drop the busy one and
+            try again with the next pair
+    Step 6  no pair left  -> 409 with the reason: vehicle_busy, no_technician or no_bay
+
+    The database has the final say: three exclusion constraints reject any overlap, even
+    from another API server. Steps 3 and 4 are a fast first guess; step 5 handles the
+    case where the guess is out of date."""
     async with session.begin():
+        # Step 1: check the request. Collect every field error, so the client sees all
+        # of them in one 422 instead of one at a time.
         errors = check_start(req.start, now)
         dealership = await repository.get_dealership(session, req.dealership_id)
         service_type = await repository.get_service_type(session, req.service_type_id)
@@ -108,6 +123,9 @@ async def book(session: AsyncSession, req: BookingRequest, *, now: datetime) -> 
             raise BookingValidationError(errors)
         assert dealership is not None and service_type is not None
 
+        # Step 1 (continued): the times. end = start + work time, and
+        # reserved_until = end + cleanup buffer. The work must fit the opening hours,
+        # in the dealership's own time zone.
         start = req.start
         end, reserved_until = compute_times(
             start, service_type.duration_minutes, service_type.buffer_minutes
@@ -121,14 +139,20 @@ async def book(session: AsyncSession, req: BookingRequest, *, now: datetime) -> 
                 reason="outside_hours",
             )
 
-        # one booking per dealership at a time: no insert deadlocks, exact load counts;
-        # then one per vehicle, because no_vehicle_overlap spans dealerships
+        # Step 2: locks. One booking per dealership at a time: no insert deadlocks, exact
+        # load counts. Then one per vehicle, because no_vehicle_overlap spans dealerships.
+        # Postgres releases both when the transaction ends (commit, rollback or error).
         await repository.lock_dealership(session, dealership.id)
         await repository.lock_vehicle(session, req.vehicle_id)
 
+        # Step 3: this car already has an overlapping booking: refuse now, and name it.
         clash = await repository.find_vehicle_clash(session, req.vehicle_id, start, reserved_until)
         if clash is not None:
             raise _rejected(_vehicle_busy(clash), attempts=0)
+
+        # Step 4: candidates, best first. Technicians: qualified, free for the whole range,
+        # least booked work that local day first (tie: lowest id). Bays: right type, free,
+        # lowest id first.
 
         day_from, day_to = local_day_bounds(start, tz)
         techs = await repository.candidate_techs(
@@ -148,8 +172,10 @@ async def book(session: AsyncSession, req: BookingRequest, *, now: datetime) -> 
             reserved_until=reserved_until,
         )
 
-        # Each failed attempt drops one technician or one bay, so the loop ends after at
-        # most len(techs) + len(bays) attempts; no fixed cap (design.md Data Flow).
+        # Step 5: try pairs, best first. Each insert runs in a SAVEPOINT: if Postgres
+        # rejects it (23P01, naming the constraint), only that try is undone, not the whole
+        # transaction. Each failed attempt drops one technician or one bay, so the loop ends
+        # after at most len(techs) + len(bays) attempts; no fixed cap (design.md Data Flow).
         record: AppointmentRecord | None = None
         attempts = 0
         while techs and bays:
@@ -178,8 +204,8 @@ async def book(session: AsyncSession, req: BookingRequest, *, now: datetime) -> 
                 break
 
         if record is None:
-            # A resent request may lose on any index; read the vehicle again so the reason
-            # does not depend on index order.
+            # Step 6: no pair worked. A resent request may lose on any index; read the
+            # vehicle again so the reason does not depend on index order.
             clash = await repository.find_vehicle_clash(
                 session, req.vehicle_id, start, reserved_until
             )
