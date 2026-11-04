@@ -15,7 +15,7 @@ Part of the [system design](../design.md).
 | `latency_ms` | time spent in the app for this request |
 | `appointment_id` | set when a booking or cancel touches an appointment |
 | `reason` | set on a 409 (`no_bay`, `no_technician`, `vehicle_busy`) or a 422 `outside_hours` |
-| `attempts` | number of insert attempts in the booking loop (1 to \|T\| + \|B\|) |
+| `attempts` | number of insert attempts in the booking loop (1 to \|T\| + \|B\|; 0 when the booking is rejected before the first insert) |
 
 ## Label cardinality
 

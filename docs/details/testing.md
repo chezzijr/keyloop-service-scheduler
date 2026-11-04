@@ -7,7 +7,7 @@ Unit tests (no database, fast):
 - End time: `end` = start + `duration_minutes`, `reserved_until` = `end` + `buffer_minutes`, and the half-open range `[start, reserved_until)`.
 - Buffer near closing: a job whose work ends exactly at closing time is accepted even though its buffer runs past it.
 - Request validation: a start off the 15-minute grid, with seconds, in the past, or more than 90 days ahead is rejected with 422. The clock is injected, so tests do not depend on today's date.
-- DST: the opening-hours check in `Europe/London` around 2026-10-25 (a Sunday), the day clocks go back. The test passes its own opening windows (08:00 local), so it does not depend on seed data. 08:00 local is 07:00 UTC on 2026-10-24 and 08:00 UTC on 2026-10-25, so a 07:00 UTC start is accepted on the first day and refused with `outside_hours` on the second. The clock is fixed to a date before them, so the past-start rule does not interfere.
+- DST: the opening-hours check in `Europe/London` around 2026-10-25 (a Sunday), the day clocks go back. The test passes its own opening windows (08:00 local), so it does not depend on seed data. 08:00 local is 07:00 UTC on 2026-10-24 and 08:00 UTC on 2026-10-25, so a 07:00 UTC start is accepted on the first day and refused on the second. The test calls the opening-hours check directly, so it needs no clock.
 - Reason precedence: a vehicle booked meanwhile gives `vehicle_busy` first. Otherwise an empty tech list gives `no_technician` even when bays are also empty. Empty bay list only gives `no_bay`. 
 
 Integration tests on real Postgres (testcontainers starts `postgres:18`; Alembic builds the schema; each test runs in a clean state):
@@ -18,7 +18,7 @@ Integration tests on real Postgres (testcontainers starts `postgres:18`; Alembic
 - Buffer blocks: after a 90-min job at 09:00 (reserved until 10:45), a booking for the same technician at 10:30 is refused and one at 10:45 succeeds.
 - Cancel frees the slot: book, cancel, then book the same slot again and get 201. Cancelling twice returns 200 with the same record.
 - Vehicle overlap: a second booking for the same vehicle that overlaps the first returns 409 `vehicle_busy` with the first appointment's id, even when another bay and technician are free. A direct insert fails on `no_vehicle_overlap`.
-- Least-loaded pick: with two qualified technicians and one already booked for 2 hours that day, the booking goes to the other one. With equal load, it goes to the lower id.
+- Least-loaded pick: with two qualified technicians and one already booked for 60 minutes that day, the booking goes to the other one. With equal load, it goes to the lower id.
 - `outside_hours`: a booking that starts before opening or whose work ends after closing returns 422 with `reason: outside_hours`.
 - Database guards: inserting a status other than `confirmed` or `cancelled` fails on `status_valid`; a bay from another dealership fails on `bay_in_dealership`, and a technician from another dealership fails on `tech_in_dealership`.
 - Vehicle ownership: a vehicle that belongs to another customer returns 422.
@@ -30,6 +30,7 @@ Concurrency tests (real Postgres, real parallel connections):
 
 - One slot, capacity k. Seed k qualified technicians and k compatible bays. Send N > k bookings for the same start at the same time with `asyncio.gather`, each with its own vehicle and its own connection. Expect exactly k responses of 201 and N - k of 409. This holds for any k, because the loop has no fixed attempt cap (see [Data Flow](../design.md#data-flow)). Then query the table and check that no two active rows share a bay or a technician with overlapping `during`. No request may fail with a deadlock (`40P01`); before the dealership lock, this test found one.
 - Same request twice at once. Seed exactly one qualified technician and one compatible bay, so the losing request has no other candidate. Send the same request twice in parallel. Expect one 201 and one 409 `vehicle_busy` with the first appointment's id, and exactly one row. This checks that the reason does not depend on which index Postgres checks first (see [Data Flow](../design.md#data-flow)).
+- Vehicle lock. Another transaction holds a vehicle's advisory lock; a booking for that vehicle waits on it until the statement timeout (503) instead of inserting. This backs the vehicle lock in Concurrency and Correctness: the same vehicle booked at two dealerships at once must not deadlock on `no_vehicle_overlap`.
 
 API tests (httpx `AsyncClient` against the app in process, on the same test database):
 

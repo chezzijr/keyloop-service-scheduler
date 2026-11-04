@@ -95,7 +95,7 @@ erDiagram
 
 ## Seed service types
 
-Seed service types. Durations are illustrative, in the style of standard labour times, not real figures from a manufacturer. The set covers one shared bay type (`lift`), two special bays (`alignment`, `mot_lane`) for the `no_bay` case, and rare skills for the `no_technician` case.
+Seed service types. Durations are illustrative, in the style of standard labour times, not real figures from a manufacturer. The set covers one shared bay type (`lift`), two special bays (`alignment`, `mot_lane`), and rare skills. Two wheel alignments at once give `no_bay` (two qualified technicians, one bay); two MOT tests or two EV checks at once give `no_technician` (one qualified technician).
 
 | Service type | Duration | Buffer | Bay type | Skill |
 |---|---|---|---|---|

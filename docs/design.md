@@ -91,7 +91,7 @@ flowchart LR
 | Seed script | Loads the reference data (Assumption 1): dealerships, bays, technicians, skills, opening hours, service types, customers and vehicles. |
 | Observability outputs | `/metrics` in Prometheus text format, and JSON logs on stdout. OTel tracing is designed but not built (see Observability). |
 
-Deployment. `docker compose` runs two services: `api` (the FastAPI app under uvicorn) and `postgres` (the `postgres:18` image with a named volume). Migrations run before the API starts. The seed script is a separate command. The API keeps no state between requests. Everything lives in Postgres, so more API containers can be added without code changes (see Scalability, Performance and Reliability).
+Deployment. `docker compose` runs two long-running services: `api` (the FastAPI app under uvicorn) and `db` (the `postgres:18` image with a named volume). Migrations run before the API starts. A third service, `seed` (profile `tools`), runs the seed script as a separate command. The API keeps no state between requests. Everything lives in Postgres, so more API containers can be added without code changes (see Scalability, Performance and Reliability).
 
 ## Data Model
 
@@ -141,7 +141,7 @@ ALTER TABLE appointment
 
 ## API
 
-The OpenAPI UI served at `/docs` is the mocked client. It lists every endpoint with its schema and lets a reviewer send requests from the browser.
+The OpenAPI UI served at `/docs` is the mocked client. It lists every endpoint except `/metrics` (plain text for Prometheus) with its schema and lets a reviewer send requests from the browser.
 
 | Method | Path | Purpose | Success codes |
 |---|---|---|---|
@@ -256,7 +256,7 @@ Resent requests. A client that times out may send the same booking again. Both r
 
 Load read. The "booked minutes that local day" used to rank technicians is read under the dealership lock, so two requests cannot both pick the same least-loaded technician from the same count. Even without the lock, a stale count could only affect how evenly work is spread. It cannot cause a double-booking, because the insert is still checked by `no_tech_overlap` (Assumption 4).
 
-Checked against Postgres. A test run on the `postgres:18` Docker image with `btree_gist` and the two constraints gave these results:
+Checked against Postgres. A test run on the `postgres:18` Docker image with `btree_gist` and the technician and bay constraints (the vehicle constraint came later) gave these results:
 
 | Case | Result |
 |---|---|
@@ -325,13 +325,13 @@ Built:
 - Indexes for overlap queries. Each exclusion constraint creates a GiST index on `(service_bay_id, during)` `(technician_id, during)` or `(vehicle_id, during)`. The candidate queries filter on the same columns with `=` and `&&`, so they can use these indexes and do not scan the whole table.
 - Small query count. A booking runs a fixed number of reads, then usually one insert. There is no N+1 pattern.
 - Connection pool. SQLAlchemy keeps a pool of connections per instance. Its defaults are `pool_size=5` and `max_overflow=10`, so one instance can open up to 15 connections. The rule to keep is: instances x (pool_size + max_overflow) below Postgres `max_connections` (100 by default), with room for migrations and admin access. The values come from settings, not code.
-- Timeouts. A database `statement_timeout` (planned default: 5 seconds) bounds any query, including an insert that waits on another transaction for the same bay or technician. A request that hits it returns 503 and does not hold a connection forever.
+- Timeouts. A database `statement_timeout` (default 5 seconds, `DB_STATEMENT_TIMEOUT_MS`) bounds any query, including an insert that waits on another transaction for the same bay or technician. A request that hits it returns 503 and does not hold a connection forever.
 - Client retries. A client that times out does not know if its booking was stored. If it sends the same request again, the booking is made now, or it gets 409 `vehicle_busy` with the id of the booking it already has. It never gets two appointments (Assumptions 18 and 19).
 - Readiness. `/ready` lets a load balancer route around an instance that has lost the database (see Observability).
 
 Maintainability (built):
 
-- Layers with one job each: routers and schemas (HTTP), service layer (business rules), repository (SQL). The business rules use no HTTP or database types, so they can change and be unit tested on their own (see Architecture).
+- Layers with one job each: routers and schemas (HTTP), service layer (business rules), repository (SQL). The service layer uses no HTTP types, and the pure rules in `services/rules.py` use no database types either, so they can change and be unit tested on their own (see Architecture).
 - The schema changes only through Alembic migrations, so every environment and test database has the same schema and its history.
 - The OpenAPI spec is generated from the code, so the API contract cannot drift from the implementation.
 - Configuration (database URL, pool size, timeouts) comes from environment settings, not code.
