@@ -1,6 +1,6 @@
 # Demo walkthrough
 
-A reviewer can follow this page in about 10 minutes. It is also the script for the video. Every step names the requirement it shows. The client is mocked, as the brief allows for a backend submission: the OpenAPI page, cURL scripts and the test suite stand in for a front end.
+A reviewer can follow this page in about 10 minutes. Every step names the requirement it shows. The client is mocked, as the brief allows for a backend submission: the OpenAPI page, cURL scripts and the test suite stand in for a front end.
 
 Prerequisites are in the [README](../README.md#prerequisites). All commands run from the repository root.
 
@@ -99,15 +99,3 @@ About 120 tests in a few seconds: unit (rules, DST), integration on a real `post
 ```
 docker compose down -v
 ```
-
-## Video outline (5-10 minutes)
-
-| Time | Part | Show |
-|---|---|---|
-| 0:00 | Intro | who I am, Scenario A, backend implemented and client mocked |
-| 0:45 | Design | [design.md](design.md): architecture diagram, Data Flow sequence, the three exclusion constraints |
-| 2:15 | Implementation | layers (router, service, repository), the savepoint insert loop, the dealership and vehicle locks |
-| 3:30 | Demo | steps 2 to 5 above: Swagger booking and 409, `demo.sh`, `race.sh` and `board.sh`, request id in the logs, `/ready` with the database stopped |
-| 6:00 | AI collaboration | from [ai-log.md](ai-log.md): how I planned and verified with the AI; the deadlock the concurrency test found; the gaps the review found |
-| 8:00 | Tests | `uv run pytest -q` |
-| 8:30 | Lessons | what was hard, what I would build next ([Future Work](design.md#out-of-scope-and-future-work)) |
