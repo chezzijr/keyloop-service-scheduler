@@ -405,7 +405,7 @@ The rule I followed: the AI proposes, I choose, a run or a test confirms.
 
 What I would do differently, and the limits:
 
-- An AI reviewing AI catches a lot, but not everything. My own read of this document was the last check: I read it in full before submitting.
+- An AI reviewing AI catches a lot, but not everything.
 - A claim that sounds like standard database behaviour can still be wrong: the same-key race above was written as fact and was false. From now on, behaviour the design depends on is run on `postgres:18` before it goes in the doc.
 
 ## Out of Scope and Future Work
