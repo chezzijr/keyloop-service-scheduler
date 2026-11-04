@@ -40,6 +40,14 @@ Six steps, each with its HTTP status: book, read, the same vehicle again (`vehic
 
 Ten oil-change bookings are sent at the same moment, one per fleet vehicle. Only 3 lifts exist, so exactly 3 get `201` and 7 get `409 no_bay`. The script then asks Postgres directly for any two active appointments that share a bay or technician at overlapping times: the answer is `0`. The guarantee comes from three exclusion constraints in the database (see [Concurrency and Correctness](design.md#concurrency-and-correctness)), so it holds with any number of API instances.
 
+See the result as a workshop board, read from the database:
+
+```
+./scripts/board.sh
+```
+
+Three rows at 14:00: three different lifts, three different technicians. After `demo.sh`, the board also shows the cancelled brake booking and the new booking that took its lift and technician.
+
 Both scripts expect fresh seed data. A second run on the same data stops and prints the reset command: `docker compose down -v && docker compose up -d --build && docker compose run --rm seed`.
 
 ## 5. Observability
@@ -99,7 +107,7 @@ docker compose down -v
 | 0:00 | Intro | who I am, Scenario A, backend implemented and client mocked |
 | 0:45 | Design | [design.md](design.md): architecture diagram, Data Flow sequence, the three exclusion constraints |
 | 2:15 | Implementation | layers (router, service, repository), the savepoint insert loop, the dealership and vehicle locks |
-| 3:30 | Demo | steps 2 to 5 above: Swagger booking and 409, `demo.sh`, `race.sh`, request id in the logs, `/ready` with the database stopped |
+| 3:30 | Demo | steps 2 to 5 above: Swagger booking and 409, `demo.sh`, `race.sh` and `board.sh`, request id in the logs, `/ready` with the database stopped |
 | 6:00 | AI collaboration | from [ai-log.md](ai-log.md): how I planned and verified with the AI; the deadlock the concurrency test found; the gaps the review found |
 | 8:00 | Tests | `uv run pytest -q` |
 | 8:30 | Lessons | what was hard, what I would build next ([Future Work](design.md#out-of-scope-and-future-work)) |

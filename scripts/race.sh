@@ -10,6 +10,8 @@
 # BASE_URL defaults to http://localhost:8000. START (UTC, e.g. 2026-11-10T14:00:00Z) defaults
 # to the next weekday at least 2 days ahead, 14:00 Europe/London (demo.sh uses 10:00).
 set -euo pipefail
+cd "$(dirname "$0")/.."  # docker compose needs the repo root
+source scripts/lib/pretty.sh
 
 BASE_URL="${BASE_URL:-http://localhost:8000}"
 OIL=1 FLEET_CUSTOMER=4 FIRST_VEHICLE=5 N=10 CAPACITY=3
@@ -25,8 +27,10 @@ fi
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 
+title "Rush hour: a fleet customer books $N cars into the same slot at the same moment"
 curl -s -f -o /dev/null --retry 30 --retry-all-errors --retry-delay 1 "$BASE_URL/health"
-echo "Slot: $START. Sending $N oil-change bookings at once (capacity: $CAPACITY lifts)."
+note "Slot: $(local_time "$START") London ($START). Service: oil change."
+note "Free capacity for that slot: $CAPACITY lifts. All $N requests are sent in parallel."
 
 for i in $(seq 0 $((N - 1))); do
   vehicle=$((FIRST_VEHICLE + i))
@@ -37,31 +41,34 @@ for i in $(seq 0 $((N - 1))); do
 done
 wait
 
-echo
-printf '%-8s %-6s %s\n' vehicle status result
+heading "Responses"
+printf '  %s%-9s %-26s %s%s\n' "$BOLD" vehicle status result "$RESET"
 booked=0 rejected=0
 for i in $(seq 0 $((N - 1))); do
   vehicle=$((FIRST_VEHICLE + i))
   status=$(cat "$OUT/$vehicle.status")
   if [[ "$status" == 201 ]]; then
     booked=$((booked + 1))
-    result=$(jq -r '"booked: \(.bay.name), \(.technician.name)"' "$OUT/$vehicle.json")
+    result=$(jq -r '"booked  \(.bay.name), \(.technician.name)"' "$OUT/$vehicle.json")
   else
     if [[ "$status" == 409 ]]; then rejected=$((rejected + 1)); fi
     result=$(jq -r '.reason // .title' "$OUT/$vehicle.json" 2>/dev/null || echo "?")
   fi
-  printf '%-8s %-6s %s\n' "$vehicle" "$status" "$result"
+  printf '  %-9s %s  %s\n' "#$vehicle" "$(status_text "$status" 21)" "$result"
 done
-
-echo
-echo "201 booked: $booked (expected $CAPACITY)   409 rejected: $rejected (expected $((N - CAPACITY)))"
 
 overlaps=$(docker compose exec -T db psql -U scheduler -d scheduler -Atc "
   SELECT count(*) FROM appointment a JOIN appointment b ON a.id < b.id
   WHERE a.status <> 'cancelled' AND b.status <> 'cancelled'
     AND (a.service_bay_id = b.service_bay_id OR a.technician_id = b.technician_id)
     AND a.during && b.during")
-echo "Pairs of active appointments sharing a bay or technician at overlapping times: $overlaps (expected 0)"
+heading "Result"
+check() {  # label actual expected
+  if [[ "$2" == "$3" ]]; then ok "$1: $2"; else fail "$1: $2 (expected $3)"; fi
+}
+check "booked (201)" "$booked" "$CAPACITY"
+check "rejected (409)" "$rejected" "$((N - CAPACITY))"
+check "double-booked bay or technician pairs, checked in Postgres" "$overlaps" 0
 
 if [[ "$booked" != "$CAPACITY" || "$rejected" != $((N - CAPACITY)) || "$overlaps" != 0 ]]; then
   if [[ "$booked" == 0 ]] && grep -q vehicle_busy "$OUT"/*.json; then
@@ -71,4 +78,4 @@ if [[ "$booked" != "$CAPACITY" || "$rejected" != $((N - CAPACITY)) || "$overlaps
   fi
   exit 1
 fi
-echo "Race finished: exactly $CAPACITY bookings, no double-booking."
+printf '\n  %sExactly %s bookings for %s lifts. Nobody was double-booked.%s\n' "$BOLD$GREEN" "$CAPACITY" "$CAPACITY" "$RESET"

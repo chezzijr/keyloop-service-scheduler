@@ -37,6 +37,16 @@ Show that parallel requests never double-book:
 
 It sends 10 oil-change bookings at the same moment for 3 free lifts, expects exactly 3 `201` and 7 `409`, then asks Postgres whether any bay or technician is double-booked (expected `0`). Its slot is 14:00 London time, so it does not clash with `demo.sh`.
 
+See every booking in the database, with names and local times:
+
+```
+./scripts/board.sh
+```
+
+It reads the `appointment` table directly with `psql`. `work_ends` is the planned end of the work and `bay_free` the end of the cleanup buffer. Cancelled bookings stay listed with their status.
+
+The three scripts share their formatting in `scripts/lib/pretty.sh`. They print colours only to a terminal; set `NO_COLOR=1` to turn them off.
+
 Stop and delete the data:
 
 ```sh
